@@ -50,6 +50,11 @@ button, select { font: inherit; }
 .tiptap p { margin: 0 0 0.85rem; }
 .tiptap ul, .tiptap ol { padding-left: 1.7rem; }
 .tiptap a { color: #195ea8; text-decoration: underline; }
+.tiptap .text-issue--spelling { text-decoration: underline wavy #d04444 1.5px; text-underline-offset: 3px; }
+.tiptap .text-issue--grammar { text-decoration: underline wavy #3679c8 1.5px; text-underline-offset: 3px; }
+.correction-panel { flex-shrink: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 0.8rem; background: white; border-top: 1px solid #cbd3df; font-size: 0.85rem; }
+.correction-panel button { border: 1px solid #afbdcf; border-radius: 0.35rem; background: #f8fbff; padding: 0.3rem 0.55rem; cursor: pointer; }
+.completion-hint { color: #cfe3ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .status-bar { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 1rem; background: #22334b; color: white; font-size: 0.75rem; }
 .status-bar button { border: 0; background: transparent; color: white; text-decoration: underline; cursor: pointer; }
 .vim-command { display: flex; align-items: center; flex: 1; gap: 0.3rem; }
@@ -75,6 +80,14 @@ button, select { font: inherit; }
 .settings-panel h2 { grid-column: 1 / -1; }
 .settings-panel label { display: grid; gap: 0.3rem; font-size: 0.87rem; }
 .settings-panel select { border: 1px solid #aeb9c8; border-radius: 0.4rem; padding: 0.6rem; background: white; }
+.settings-panel input { border: 1px solid #aeb9c8; border-radius: 0.4rem; padding: 0.6rem; background: white; min-width: 0; }
+.settings-wide { grid-column: 1 / -1; }
+.personal-dictionary { display: grid; gap: 0.5rem; font-size: 0.87rem; }
+.personal-dictionary > div { display: flex; gap: 0.5rem; }
+.personal-dictionary > div input { flex: 1; }
+.personal-dictionary button { border: 1px solid #afbdcf; border-radius: 0.4rem; background: white; padding: 0.4rem; cursor: pointer; }
+.personal-dictionary ul { display: flex; flex-wrap: wrap; gap: 0.4rem; list-style: none; padding: 0; margin: 0; max-height: 8rem; overflow: auto; }
+.personal-dictionary li { border: 1px solid #d6dde7; border-radius: 0.4rem; padding: 0.2rem 0.4rem; }
 @media (max-width: 680px) {
   .app-header { align-items: stretch; flex-direction: column; padding: calc(0.65rem + max(env(safe-area-inset-top), 24px)) 0.65rem 0.65rem; }
   .app-header p { display: none; }

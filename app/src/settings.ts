@@ -8,9 +8,13 @@ export type Settings = {
   defaultView: "mobile" | "page";
   vimEnabled: boolean;
   hideMenu: boolean;
+  autocorrect: boolean;
+  autocomplete: boolean;
+  grammarUrl: string;
 };
 export const defaultSettings: Settings = {
   autosaveMs: 800, language: "ru", vimLayout: "physical", defaultView: "mobile", vimEnabled: true, hideMenu: false,
+  autocorrect: true, autocomplete: true, grammarUrl: "",
 };
 const file = "library/settings.json";
 const storageKey = "docx-vim-settings";
@@ -27,6 +31,9 @@ export async function readSettings(): Promise<Settings> {
       defaultView: value.defaultView === "page" ? "page" : "mobile",
       vimEnabled: value.vimEnabled !== false,
       hideMenu: value.hideMenu === true,
+      autocorrect: value.autocorrect !== false,
+      autocomplete: value.autocomplete !== false,
+      grammarUrl: typeof value.grammarUrl === "string" ? value.grammarUrl.trim() : "",
     };
   } catch { return defaultSettings; }
 }

@@ -19,6 +19,12 @@
     "fs:allow-write-file",
     "fs:allow-rename",
     "clipboard-manager:allow-read-text",
-    "clipboard-manager:allow-write-text"
+    "clipboard-manager:allow-write-text",
+    { "identifier": "http:default", "allow": [
+      { "url": "https://*" },
+      { "url": "http://localhost:*" },
+      { "url": "http://127.0.0.1:*" },
+      { "url": "http://10.0.2.2:*" }
+    ] }
   ]
 }

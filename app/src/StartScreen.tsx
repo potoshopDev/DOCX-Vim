@@ -10,6 +10,7 @@ import { editorExtensions } from "./editor-extensions";
 import { listDrafts, readDraft, writeDraft, type Draft } from "./draft";
 import { listRecent, rememberDocument, type RecentDocument } from "./library";
 import { defaultSettings, readSettings, writeSettings, type Settings } from "./settings";
+import { readPersonalDictionary, writePersonalDictionary, type Language, type PersonalDictionary } from "./personal-dictionary";
 import { openDocumentWindow, openWindowIds } from "./windows";
 
 export default function StartScreen() {
@@ -19,6 +20,8 @@ export default function StartScreen() {
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [showSettings, setShowSettings] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [personal, setPersonal] = useState<PersonalDictionary>({ ru: [], en: [] });
+  const [newWord, setNewWord] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
   const refresh = useCallback(async () => {
     const [savedDrafts, savedRecent, windows] = await Promise.all([listDrafts(), listRecent(), openWindowIds()]);
@@ -27,6 +30,7 @@ export default function StartScreen() {
   useEffect(() => {
     void refresh();
     void readSettings().then(setSettings);
+    void readPersonalDictionary().then(setPersonal);
     const onFocus = () => { void refresh(); };
     addEventListener("focus", onFocus);
     return () => removeEventListener("focus", onFocus);
@@ -108,6 +112,11 @@ export default function StartScreen() {
     setSettings(next);
     void writeSettings(next).catch(() => {});
   };
+  const changeDictionary = (language: Language, words: string[]) => {
+    const next = { ...personal, [language]: [...new Set(words.map((word) => word.toLocaleLowerCase(language)))].sort() };
+    setPersonal(next);
+    void writePersonalDictionary(next).catch(() => {});
+  };
 
   return <main className="start-screen">
     <header className="start-header">
@@ -137,6 +146,20 @@ export default function StartScreen() {
             <option value="ru">Русский</option><option value="en">Английский</option>
           </select>
         </label>
+        <label>Автозамена
+          <select value={settings.autocorrect ? "on" : "off"} onChange={(event) => changeSetting({ autocorrect: event.target.value === "on" })}>
+            <option value="on">Включена</option><option value="off">Выключена</option>
+          </select>
+        </label>
+        <label>Подсказки слов
+          <select value={settings.autocomplete ? "on" : "off"} onChange={(event) => changeSetting({ autocomplete: event.target.value === "on" })}>
+            <option value="on">Включены</option><option value="off">Выключены</option>
+          </select>
+        </label>
+        <label className="settings-wide">Сервер LanguageTool для грамматики (необязательно)
+          <input type="url" value={settings.grammarUrl} placeholder="https://example.org или http://localhost:8081"
+            onChange={(event) => changeSetting({ grammarUrl: event.target.value })} />
+        </label>
         <label>Раскладка команд Vim
           <select value={settings.vimLayout} onChange={(event) => changeSetting({ vimLayout: event.target.value as Settings["vimLayout"] })}>
             <option value="physical">По физическим клавишам</option><option value="translated">Перевод русской раскладки</option>
@@ -157,6 +180,12 @@ export default function StartScreen() {
             <option value="mobile">Мобильный вид</option><option value="page">Страница</option>
           </select>
         </label>
+        <div className="settings-wide personal-dictionary">
+          <strong>Пользовательский словарь · {settings.language === "ru" ? "русский" : "английский"}</strong>
+          <div><input value={newWord} onChange={(event) => setNewWord(event.target.value)} placeholder="Новое слово" />
+            <button type="button" onClick={() => { const word = newWord.trim(); if (/^[\p{L}ёЁ'-]{2,64}$/u.test(word)) { changeDictionary(settings.language, [...personal[settings.language], word]); setNewWord(""); } }}>Добавить</button></div>
+          <ul>{personal[settings.language].map((word) => <li key={word}>{word} <button type="button" onClick={() => changeDictionary(settings.language, personal[settings.language].filter((item) => item !== word))}>Удалить</button></li>)}</ul>
+        </div>
       </section>}
       <section className="start-panel"><h2>Черновики</h2>
         {drafts.length ? <ul className="document-list">{drafts.map((draft) => <li key={draft.id}>

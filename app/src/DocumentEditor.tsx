@@ -11,6 +11,10 @@ import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
 import { readDraft, writeDraft, type Draft } from "./draft";
 import { editorExtensions } from "./editor-extensions";
 import { readSettings } from "./settings";
+import { defaultSettings, type Settings } from "./settings";
+import { readPersonalDictionary, writePersonalDictionary, type PersonalDictionary, type Language } from "./personal-dictionary";
+import { TextCheck, textCheckKey, type TextIssue } from "./text-check-extension";
+import { checkGrammar } from "./grammar";
 import { VimMode as VimExtension, getVimMode } from "vim-prosemirror/tiptap";
 import "vim-prosemirror/style.css";
 import { VimAdapter, type VimMode } from "./vim-adapter";
@@ -28,6 +32,23 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [busy, setBusy] = useState(false);
   const [vimEnabled, setVimEnabled] = useState(true);
   const [hideMenu, setHideMenu] = useState(false);
+  const [assistSettings, setAssistSettings] = useState<Settings>(defaultSettings);
+  const [personal, setPersonal] = useState<PersonalDictionary>({ ru: [], en: [] });
+  const [issues, setIssues] = useState<TextIssue[]>([]);
+  const [selectedIssue, setSelectedIssue] = useState<TextIssue | null>(null);
+  const [completion, setCompletion] = useState<{ from: number; to: number; suggestion: string } | null>(null);
+  const [selectionRevision, setSelectionRevision] = useState(0);
+  const issuesRef = useRef<TextIssue[]>([]);
+  const ignoredIssues = useRef(new Set<string>());
+  const completionRef = useRef<typeof completion>(null);
+  const assistSettingsRef = useRef(assistSettings);
+  const personalRef = useRef(personal);
+  const checkWorker = useRef<Worker | null>(null);
+  const nextWorkerId = useRef(0);
+  const workerRequests = useRef(new Map<number, (response: any) => void>());
+  assistSettingsRef.current = assistSettings;
+  personalRef.current = personal;
+  completionRef.current = completion;
   const [vimMode, setVimMode] = useState<VimMode>("normal");
   const [showHeadings, setShowHeadings] = useState(false);
   const [commandLine, setCommandLine] = useState<string | null>(null);
@@ -59,14 +80,53 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     scrollTop: editorArea.current?.scrollTop,
   });
   const editor = useEditor({
-    extensions: [...editorExtensions, VimExtension],
+    extensions: [...editorExtensions, VimExtension, TextCheck],
     content: "<p></p>",
     editorProps: {
-      handleKeyDown: (_view, event) => vim.current?.handle(event) ?? false,
+      handleKeyDown: (_view, event) => {
+        const editable = !vim.current?.enabled || vim.current?.mode() === "insert";
+        if (editable && completionRef.current && (event.key === "Tab" || (event.ctrlKey && event.code === "Space"))) {
+          event.preventDefault();
+          const item = completionRef.current;
+          editor?.chain().focus().insertContentAt({ from: item.from, to: item.to }, item.suggestion).run();
+          setCompletion(null);
+          return true;
+        }
+        if (editable && event.key === "Escape" && completionRef.current) { setCompletion(null); return true; }
+        if (editable && event.ctrlKey && event.code === "Space") { setSelectionRevision((value) => value + 1); event.preventDefault(); return true; }
+        return vim.current?.handle(event) ?? false;
+      },
+      handleTextInput: (view, from, to, text) => {
+        if (!assistSettingsRef.current.autocorrect || (vim.current?.enabled && vim.current.mode() !== "insert")) return false;
+        const $from = view.state.doc.resolve(from);
+        const before = $from.parent.textBetween(Math.max(0, $from.parentOffset - 2), $from.parentOffset);
+        if (text === "-" && before.endsWith("-")) {
+          view.dispatch(view.state.tr.insertText("—", from - 1, to));
+          return true;
+        }
+        if (text === '"') {
+          const prior = $from.parent.textBetween(0, $from.parentOffset);
+          const opening = !prior || /[\s([{«—]/u.test(prior.slice(-1));
+          view.dispatch(view.state.tr.insertText(opening ? "«" : "»", from, to));
+          return true;
+        }
+        return false;
+      },
+      handleClick: (_view, pos) => {
+        const issue = issuesRef.current.find((item) => item.from <= pos && pos <= item.to);
+        setSelectedIssue(issue ?? null);
+        if (issue?.kind === "spelling") {
+          const language: Language = /[А-Яа-яЁё]/.test(issue.word) ? "ru" : "en";
+          void askWorker({ type: "suggest", word: issue.word, language }).then((result: { suggestions: string[] }) => {
+            setSelectedIssue((current) => current?.from === issue.from && current?.to === issue.to ? { ...current, suggestions: result.suggestions } : current);
+          });
+        }
+          return false;
+      },
       attributes: {
         lang: "ru",
         "aria-label": "Текст документа",
-        spellcheck: "true",
+        spellcheck: "false",
       },
     },
     onUpdate: () => {
@@ -75,7 +135,27 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
       }
     },
-    onTransaction: ({ editor: current }) => setVimMode(getVimMode(current)),
+    onTransaction: ({ editor: current, transaction }) => {
+      setVimMode(getVimMode(current));
+      if (transaction.selectionSet || transaction.docChanged) setSelectionRevision((value) => value + 1);
+    },
+  });
+  useEffect(() => {
+    const worker = new Worker(new URL("./text-check.worker.ts", import.meta.url), { type: "module" });
+    checkWorker.current = worker;
+    worker.onmessage = (event: MessageEvent<{ id: number }>) => {
+      const resolve = workerRequests.current.get(event.data.id);
+      if (resolve) { workerRequests.current.delete(event.data.id); resolve(event.data); }
+    };
+    void readPersonalDictionary().then(setPersonal);
+    const onDictionary = (event: Event) => setPersonal((event as CustomEvent<PersonalDictionary>).detail);
+    addEventListener("personal-dictionary-changed", onDictionary);
+    return () => { worker.terminate(); checkWorker.current = null; workerRequests.current.clear(); removeEventListener("personal-dictionary-changed", onDictionary); };
+  }, []);
+  const askWorker = (message: object): Promise<any> => new Promise((resolve) => {
+    const id = ++nextWorkerId.current;
+    workerRequests.current.set(id, resolve);
+    checkWorker.current?.postMessage({ ...message, id });
   });
   useEffect(() => {
     if (!editor) return;
@@ -84,6 +164,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       if (cancelled || !draft) return;
       setVimEnabled(settings.vimEnabled);
       setHideMenu(settings.hideMenu);
+      setAssistSettings(settings);
       saver.current = new BackgroundSaver((_id, path) => {
         setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
       }, settings.autosaveMs);
@@ -175,7 +256,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   useEffect(() => {
     const refreshSettings = () => { void readSettings().then((settings) => {
       setVimEnabled(settings.vimEnabled); setHideMenu(settings.hideMenu);
-    }); if (currentReady.current) requestAnimationFrame(() => editor?.commands.focus()); };
+      setAssistSettings(settings);
+    }); void readPersonalDictionary().then(setPersonal); if (currentReady.current) requestAnimationFrame(() => editor?.commands.focus()); };
     addEventListener("focus", refreshSettings);
     return () => removeEventListener("focus", refreshSettings);
   }, [editor]);
@@ -186,6 +268,57 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       if (owner) saver.current!.schedule(currentDraft());
     });
   }, [editor, ready, revision, documentId, documentName, viewMode]);
+
+  useEffect(() => {
+    if (!editor || !ready || !checkWorker.current) return;
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      const segments: { from: number; text: string }[] = [];
+      editor.state.doc.descendants((node, pos) => {
+        if (node.isText && node.text) segments.push({ from: pos, text: node.text });
+      });
+      const snapshot = editor.state.doc.textContent;
+      void askWorker({ type: "check", segments, personal }).then(async (result: { issues: TextIssue[] }) => {
+        if (cancelled || snapshot !== editor.state.doc.textContent) return;
+        let all = (result.issues ?? []).filter((issue) => !ignoredIssues.current.has(`${issue.kind}:${issue.word}`));
+        issuesRef.current = all;
+        setIssues(all);
+        editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, all).setMeta("addToHistory", false));
+        if (assistSettings.grammarUrl.trim()) {
+          try { all = [...all, ...(await checkGrammar(segments, assistSettings.language, assistSettings.grammarUrl, controller.signal))
+            .filter((issue) => !ignoredIssues.current.has(`${issue.kind}:${issue.word}`))]; }
+          catch { /* Grammar server may be offline; local spelling remains available. */ }
+        }
+        if (cancelled || snapshot !== editor.state.doc.textContent) return;
+        issuesRef.current = all;
+        setIssues(all);
+        editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, all).setMeta("addToHistory", false));
+      });
+    }, 500);
+    return () => { cancelled = true; controller.abort(); clearTimeout(timer); };
+  }, [editor, ready, revision, personal, assistSettings.grammarUrl, assistSettings.language]);
+
+  useEffect(() => {
+    if (!editor || !ready || !assistSettings.autocomplete || (vimEnabled && vimMode !== "insert")) {
+      setCompletion(null); return;
+    }
+    const { $from, empty } = editor.state.selection;
+    if (!empty || !$from.parent.isTextblock) { setCompletion(null); return; }
+    const before = $from.parent.textBetween(0, $from.parentOffset);
+    const prefix = before.match(/[A-Za-zА-Яа-яЁё]{3,32}$/u)?.[0];
+    if (!prefix) { setCompletion(null); return; }
+    const from = $from.pos - prefix.length, to = $from.pos;
+    const language: Language = /[А-Яа-яЁё]/.test(prefix) ? "ru" : "en";
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void askWorker({ type: "complete", prefix, language, personal }).then((result: { suggestion: string }) => {
+        if (cancelled || !result.suggestion || editor.state.selection.from !== to) return;
+        setCompletion({ from, to, suggestion: /^[A-ZА-ЯЁ]/.test(prefix) ? result.suggestion[0].toLocaleUpperCase(language) + result.suggestion.slice(1) : result.suggestion });
+      });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [editor, ready, selectionRevision, vimEnabled, vimMode, assistSettings.autocomplete, personal]);
 
   const persistCurrent = async (draftIsEnough = false) => {
     if (!editor || !currentReady.current) return;
@@ -371,6 +504,34 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       editor.chain().focus().unsetLink().run();
     }
   };
+  const replaceIssue = (replacement: string) => {
+    if (!editor || !selectedIssue) return;
+    editor.chain().focus().insertContentAt({ from: selectedIssue.from, to: selectedIssue.to }, replacement).run();
+    setSelectedIssue(null);
+  };
+  const addIssueWord = () => {
+    if (!selectedIssue) return;
+    const language: Language = /[А-Яа-яЁё]/.test(selectedIssue.word) ? "ru" : "en";
+    const word = selectedIssue.word.toLocaleLowerCase(language);
+    const next = { ...personalRef.current, [language]: [...new Set([...personalRef.current[language], word])].sort() };
+    setPersonal(next);
+    void writePersonalDictionary(next).catch(() => {});
+    setSelectedIssue(null);
+    editor?.commands.focus();
+  };
+  const ignoreIssue = () => {
+    if (!selectedIssue || !editor) return;
+    ignoredIssues.current.add(`${selectedIssue.kind}:${selectedIssue.word}`);
+    const next = issuesRef.current.filter((issue) => !ignoredIssues.current.has(`${issue.kind}:${issue.word}`));
+    issuesRef.current = next;
+    setIssues(next);
+    editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, next).setMeta("addToHistory", false));
+    setSelectedIssue(null);
+    editor.commands.focus();
+  };
+  useEffect(() => {
+    if (selectedIssue && !issues.some((issue) => issue.from === selectedIssue.from && issue.to === selectedIssue.to && issue.word === selectedIssue.word)) setSelectedIssue(null);
+  }, [issues, selectedIssue]);
 
   const formatButton = (label: string, title: string, selected: boolean, action: () => void) => (
     <button
@@ -450,8 +611,17 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         <EditorContent editor={editor} className="document" />
       </section>
 
+      {selectedIssue && <div className="correction-panel" role="group" aria-label="Исправление текста">
+        <span>{selectedIssue.message || `Слово «${selectedIssue.word}» не найдено в словаре`}</span>
+        {selectedIssue.suggestions.map((word, index) => <button type="button" key={`${word}-${index}`} onClick={() => replaceIssue(word)}>{word}</button>)}
+        {selectedIssue.kind === "spelling" && <button type="button" onClick={addIssueWord}>Добавить в словарь</button>}
+        <button type="button" onClick={ignoreIssue}>Игнорировать</button>
+        <button type="button" onClick={() => setSelectedIssue(null)}>Закрыть</button>
+      </div>}
+
       <footer className="status-bar">
         <span>{vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
+        {completion && <span className="completion-hint">{completion.suggestion} · Tab / Ctrl+Space</span>}
         {commandLine !== null && <label className="vim-command">:
           <input ref={commandInput} aria-label="Команда Vim" value={commandLine}
             onChange={(event) => setCommandLine(event.target.value)}
