@@ -107,6 +107,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const channel = new BroadcastChannel(`docx-vim-${documentId}`);
     documentChannel.current = channel;
     channel.onmessage = (event: MessageEvent<{ type: string; document?: Draft["document"]; savePath?: string }>) => {
+      if (event.data.type === "active") { editor.setEditable(false); return; }
       if (event.data.type === "save-request") {
         void isDocumentSaveOwner(documentId).then((owner) => {
           if (!owner) return;
@@ -125,8 +126,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       suppressUpdate.current = false;
       setRevision((value) => value + 1);
     };
-    const onFocus = () => setRevision((value) => value + 1);
+    const onFocus = () => {
+      editor.setEditable(true);
+      channel.postMessage({ type: "active" });
+      setRevision((value) => value + 1);
+    };
     addEventListener("focus", onFocus);
+    if (document.hasFocus()) onFocus();
     return () => { removeEventListener("focus", onFocus); channel.close(); documentChannel.current = null; };
   }, [editor, ready, documentId]);
   useEffect(() => {

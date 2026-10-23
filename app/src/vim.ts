@@ -66,11 +66,14 @@ export class VimController {
     if (event.ctrlKey || event.altKey || event.metaKey) return false;
     const physical = event.code.startsWith("Key") ? event.code.slice(3).toLowerCase() : "";
     const translated = ru.indexOf(event.key.toLowerCase());
+    const fallback = translated >= 0 ? en[translated] : event.key;
     const key = event.code === "Semicolon" && event.shiftKey ? ":"
       : event.code === "Slash" && !event.shiftKey ? "/"
       : event.code === "Digit4" && event.shiftKey ? "$"
       : physical ? (event.shiftKey ? physical.toUpperCase() : physical)
-      : translated >= 0 ? en[translated] : event.key;
+      : event.shiftKey && fallback === ";" ? ":"
+      : event.shiftKey && /[a-z]/.test(fallback) ? fallback.toUpperCase()
+      : fallback;
     if (this.pending === "window") { this.pending = ""; this.windowCommand(key); event.preventDefault(); return true; }
     if (key.length !== 1 && key !== "Escape") return false;
     event.preventDefault();
