@@ -9,7 +9,8 @@ import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
 import { readDraft, type Draft } from "./draft";
 import { editorExtensions } from "./editor-extensions";
 import { readSettings } from "./settings";
-import { openWindowIds, registerDocumentTask, showLibrary } from "./windows";
+import { VimController, type VimMode } from "./vim";
+import { focusAdjacentWindow, isDocumentSaveOwner, openDocumentWindow, openWindowIds, registerDocumentTask, showLibrary } from "./windows";
 import "./App.css";
 
 type ViewMode = "page" | "mobile";
@@ -21,6 +22,12 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [revision, setRevision] = useState(0);
   const [saveStatus, setSaveStatus] = useState("Подготовка…");
   const [busy, setBusy] = useState(false);
+  const [vimEnabled, setVimEnabled] = useState(true);
+  const [hideMenu, setHideMenu] = useState(false);
+  const [vimMode, setVimMode] = useState<VimMode>("NORMAL");
+  const [showHeadings, setShowHeadings] = useState(false);
+  const vim = useRef<VimController | null>(null);
+  const documentChannel = useRef<BroadcastChannel | null>(null);
   const suppressUpdate = useRef(false);
   const editorArea = useRef<HTMLElement>(null);
   const currentId = useRef(documentId);
@@ -45,6 +52,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     extensions: editorExtensions,
     content: "<p></p>",
     editorProps: {
+      handleKeyDown: (_view, event) => vim.current?.handle(event) ?? false,
       attributes: {
         lang: "ru",
         "aria-label": "Текст документа",
@@ -52,7 +60,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       },
     },
     onUpdate: () => {
-      if (!suppressUpdate.current) setRevision((value) => value + 1);
+      if (!suppressUpdate.current) {
+        setRevision((value) => value + 1);
+        documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
+      }
     },
   });
   useEffect(() => {
@@ -60,6 +71,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     let cancelled = false;
     Promise.all([readDraft(documentId), readSettings()]).then(([draft, settings]) => {
       if (cancelled || !draft) return;
+      setVimEnabled(settings.vimEnabled);
+      setHideMenu(settings.hideMenu);
       saver.current = new BackgroundSaver((_id, path) => {
         setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
       }, settings.autosaveMs);
@@ -81,7 +94,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       currentReady.current = true;
       setReady(true);
       setSaveStatus("Готово");
-      void registerDocumentTask(documentId, draft.name);
+      void registerDocumentTask(isTauri() ? getCurrentWindow().label.slice(4) : documentId, draft.name);
       if (draft.scrollTop != null) requestAnimationFrame(() => {
         if (editorArea.current) editorArea.current.scrollTop = draft.scrollTop!;
       });
@@ -89,15 +102,64 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     }).catch(() => setSaveStatus(""));
     return () => { cancelled = true; };
   }, [editor, documentId]);
+  useEffect(() => {
+    if (!editor || !ready) return;
+    const channel = new BroadcastChannel(`docx-vim-${documentId}`);
+    documentChannel.current = channel;
+    channel.onmessage = (event: MessageEvent<{ type: string; document?: Draft["document"]; savePath?: string }>) => {
+      if (event.data.type === "save-request") {
+        void isDocumentSaveOwner(documentId).then((owner) => {
+          if (!owner) return;
+          if (event.data.savePath) currentSavePath.current = event.data.savePath;
+          void saver.current?.flush(currentDraft()).catch(() => {});
+        });
+        return;
+      }
+      if (event.data.type !== "document" || !event.data.document) return;
+      const anchor = editor.state.selection.anchor;
+      const head = editor.state.selection.head;
+      suppressUpdate.current = true;
+      editor.commands.setContent(event.data.document);
+      const max = editor.state.doc.content.size;
+      editor.commands.setTextSelection({ from: Math.min(anchor, max), to: Math.min(head, max) });
+      suppressUpdate.current = false;
+      setRevision((value) => value + 1);
+    };
+    const onFocus = () => setRevision((value) => value + 1);
+    addEventListener("focus", onFocus);
+    return () => { removeEventListener("focus", onFocus); channel.close(); documentChannel.current = null; };
+  }, [editor, ready, documentId]);
+  useEffect(() => {
+    if (!editor) return;
+    vim.current = vimEnabled ? new VimController(editor, setVimMode, (key) => {
+      if (["s", "v"].includes(key)) void openDocumentWindow(documentId, documentName, true);
+      else if (["w", "W", "p", "h", "j", "k", "l"].includes(key)) void focusAdjacentWindow(key === "W" || key === "p" || key === "h" || key === "k" ? -1 : 1);
+    }, () => { const query = window.prompt("Поиск в документе"); if (query) vim.current?.find(query); }) : null;
+    setVimMode(vimEnabled ? "NORMAL" : "INSERT");
+    return () => { vim.current = null; };
+  }, [editor, vimEnabled, documentId, documentName]);
   useEffect(() => { editor?.setEditable(ready); }, [editor, ready]);
+  useEffect(() => {
+    const refreshSettings = () => { void readSettings().then((settings) => {
+      setVimEnabled(settings.vimEnabled); setHideMenu(settings.hideMenu);
+    }); };
+    addEventListener("focus", refreshSettings);
+    return () => removeEventListener("focus", refreshSettings);
+  }, []);
   useEffect(() => {
     if (!editor || !ready) return;
     setSaveStatus("Сохранение в фоне…");
-    saver.current!.schedule(currentDraft());
+    void isDocumentSaveOwner(documentId).then((owner) => {
+      if (owner) saver.current!.schedule(currentDraft());
+    });
   }, [editor, ready, revision, documentId, documentName, viewMode]);
 
   const persistCurrent = async (draftIsEnough = false) => {
     if (!editor || !currentReady.current) return;
+    if (!(await isDocumentSaveOwner(documentId)) && documentChannel.current) {
+      documentChannel.current.postMessage({ type: "save-request", savePath: currentSavePath.current });
+      return;
+    }
     try { await saver.current!.flush(currentDraft()); }
     catch (error) {
       if (!draftIsEnough || !(error instanceof BackgroundSaveFailure && error.draftSaved)) throw error;
@@ -118,7 +180,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     if (!editor) return;
     const saveWhenHidden = () => {
       if (document.visibilityState === "hidden" && currentReady.current) {
-        void saver.current!.flush(currentDraft()).catch(() => {});
+        void isDocumentSaveOwner(documentId).then((owner) => {
+          if (owner) void saver.current!.flush(currentDraft()).catch(() => {});
+        });
       }
     };
     document.addEventListener("visibilitychange", saveWhenHidden);
@@ -192,6 +256,16 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         alignRight: current.isActive({ textAlign: "right" }),
       },
   });
+  const headings = useEditorState({
+    editor,
+    selector: ({ editor: current }) => {
+      const items: { pos: number; level: number; text: string }[] = [];
+      current?.state.doc.descendants((node, pos) => {
+        if (node.type.name === "heading") items.push({ pos, level: node.attrs.level as number, text: node.textContent || "Без названия" });
+      });
+      return items;
+    },
+  }) ?? [];
 
   const setLink = () => {
     if (!editor) return;
@@ -220,7 +294,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
 
   return (
     <main className="app-shell">
-      <header className="app-header">
+      {!hideMenu && <header className="app-header">
         <div>
           <h1>{documentName}</h1>
         </div>
@@ -236,8 +310,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
             Мобильный вид
           </button>
         </div>
-      </header>
-      <div className="toolbar" role="toolbar" aria-label="Форматирование документа">
+      </header>}
+      {!hideMenu && <div className="toolbar" role="toolbar" aria-label="Форматирование документа">
+        <button type="button" onClick={() => setShowHeadings((value) => !value)} aria-expanded={showHeadings}>Заголовки</button>
         <select
           aria-label="Стиль абзаца"
           value={active?.heading1 ? "h1" : active?.heading2 ? "h2" : active?.heading3 ? "h3" : "p"}
@@ -269,14 +344,22 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         {formatButton("Ссылка", "Добавить или изменить ссылку", !!active?.link, setLink)}
         {formatButton("↶", "Отменить", false, () => editor?.chain().focus().undo().run())}
         {formatButton("↷", "Повторить", false, () => editor?.chain().focus().redo().run())}
-      </div>
+      </div>}
+
+      {showHeadings && <nav className="headings-panel" aria-label="Навигация по заголовкам">
+        {headings.length ? headings.map((heading) => <button key={heading.pos} type="button" style={{ paddingLeft: `${heading.level}rem` }}
+          onClick={() => { editor?.chain().focus().setTextSelection(heading.pos + 1).scrollIntoView().run(); setShowHeadings(false); }}>
+          {heading.text}
+        </button>) : <span>Заголовков пока нет</span>}
+      </nav>}
 
       <section ref={editorArea} className={`editor-area editor-area--${viewMode}`} aria-label="Редактор документа">
         <EditorContent editor={editor} className="document" />
       </section>
 
       <footer className="status-bar">
-        <span>Обычный ввод</span>
+        <span>{vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
+        {hideMenu && <button type="button" onClick={() => setShowHeadings((value) => !value)}>Заголовки</button>}
         <span>{saveStatus}</span>
       </footer>
     </main>

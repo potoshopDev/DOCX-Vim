@@ -142,6 +142,16 @@ export default function StartScreen() {
             <option value="physical">По физическим клавишам</option><option value="translated">Перевод русской раскладки</option>
           </select>
         </label>
+        <label>Управление Vim
+          <select value={settings.vimEnabled ? "on" : "off"} onChange={(event) => changeSetting({ vimEnabled: event.target.value === "on" })}>
+            <option value="on">Включено</option><option value="off">Обычное редактирование</option>
+          </select>
+        </label>
+        <label>Верхнее меню редактора
+          <select value={settings.hideMenu ? "hide" : "show"} onChange={(event) => changeSetting({ hideMenu: event.target.value === "hide" })}>
+            <option value="show">Показывать</option><option value="hide">Скрыть</option>
+          </select>
+        </label>
         <label>Вид документа по умолчанию
           <select value={settings.defaultView} onChange={(event) => changeSetting({ defaultView: event.target.value as Settings["defaultView"] })}>
             <option value="mobile">Мобильный вид</option><option value="page">Страница</option>

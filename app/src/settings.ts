@@ -6,9 +6,11 @@ export type Settings = {
   language: "ru" | "en";
   vimLayout: "physical" | "translated";
   defaultView: "mobile" | "page";
+  vimEnabled: boolean;
+  hideMenu: boolean;
 };
 export const defaultSettings: Settings = {
-  autosaveMs: 800, language: "ru", vimLayout: "physical", defaultView: "mobile",
+  autosaveMs: 800, language: "ru", vimLayout: "physical", defaultView: "mobile", vimEnabled: true, hideMenu: false,
 };
 const file = "library/settings.json";
 const storageKey = "docx-vim-settings";
@@ -23,6 +25,8 @@ export async function readSettings(): Promise<Settings> {
       language: value.language === "en" ? "en" : "ru",
       vimLayout: value.vimLayout === "translated" ? "translated" : "physical",
       defaultView: value.defaultView === "page" ? "page" : "mobile",
+      vimEnabled: value.vimEnabled !== false,
+      hideMenu: value.hideMenu === true,
     };
   } catch { return defaultSettings; }
 }

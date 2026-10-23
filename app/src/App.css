@@ -34,6 +34,9 @@ button, select { font: inherit; }
 .toolbar button:focus-visible, .view-switch button:focus-visible, .toolbar select:focus-visible { outline: 2px solid #2563a6; outline-offset: 1px; }
 .toolbar button:disabled { color: #9aa4b0; cursor: default; }
 .toolbar-divider { height: 1.5rem; width: 1px; background: #cbd3df; margin: 0 0.2rem; flex: none; }
+.headings-panel { position: absolute; z-index: 10; top: 7rem; left: 0.7rem; width: min(22rem, calc(100vw - 1.4rem)); max-height: 60vh; overflow: auto; display: grid; background: white; border: 1px solid #cbd3df; border-radius: 0.6rem; box-shadow: 0 8px 24px #1a2a3e30; padding: 0.5rem; }
+.headings-panel button { border: 0; background: white; text-align: left; padding: 0.6rem; cursor: pointer; }
+.headings-panel button:hover { background: #edf4ff; }
 .editor-area { flex: 1; min-height: 0; overflow: auto; padding: 1.5rem; overscroll-behavior: contain; }
 .document { margin: 0 auto; background: #fff; box-shadow: 0 2px 15px #1a2a3e1a; }
 .editor-area--page .document { width: min(100%, 794px); min-height: 1123px; }
@@ -48,6 +51,7 @@ button, select { font: inherit; }
 .tiptap ul, .tiptap ol { padding-left: 1.7rem; }
 .tiptap a { color: #195ea8; text-decoration: underline; }
 .status-bar { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 1rem; background: #22334b; color: white; font-size: 0.75rem; }
+.status-bar button { border: 0; background: transparent; color: white; text-decoration: underline; cursor: pointer; }
 .start-screen { height: 100dvh; overflow: auto; background: #f2f5f9; }
 .start-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem max(1.25rem, calc((100vw - 900px) / 2)); background: #fff; border-bottom: 1px solid #cbd3df; }
 .start-header h1 { margin: 0; font-size: 1.4rem; }
