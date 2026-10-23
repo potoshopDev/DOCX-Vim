@@ -5,9 +5,11 @@
   font-synthesis: none;
 }
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; }
+html, body, #root { height: 100%; }
+body { margin: 0; min-width: 320px; overflow: hidden; }
 button, select { font: inherit; }
-.app-shell { min-height: 100vh; display: flex; flex-direction: column; }
+.app-shell { height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+.app-header, .toolbar, .status-bar, .recovery-banner { flex-shrink: 0; }
 .app-header {
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
   padding: 0.8rem 1.25rem; background: #fff; border-bottom: 1px solid #cbd3df;
@@ -17,9 +19,8 @@ button, select { font: inherit; }
 .file-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 .file-actions button, .recovery-banner button { border: 1px solid #aeb9c8; border-radius: 0.4rem; background: #fff; padding: 0.45rem 0.65rem; cursor: pointer; }
 .file-actions button:disabled { opacity: 0.5; cursor: default; }
-.recovery-banner, .warning-banner { padding: 0.7rem 1rem; background: #fff5db; border-bottom: 1px solid #e3c677; font-size: 0.9rem; }
+.recovery-banner { padding: 0.7rem 1rem; background: #fff5db; border-bottom: 1px solid #e3c677; font-size: 0.9rem; }
 .recovery-banner { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
-.warning-banner ul { margin: 0.35rem 0; }
 .view-switch { display: flex; border: 1px solid #aeb9c8; border-radius: 0.5rem; overflow: hidden; }
 .view-switch button, .toolbar button { border: 0; background: #fff; padding: 0.5rem 0.8rem; cursor: pointer; }
 .view-switch button + button { border-left: 1px solid #aeb9c8; }
@@ -35,7 +36,7 @@ button, select { font: inherit; }
 .toolbar button:focus-visible, .view-switch button:focus-visible, .toolbar select:focus-visible { outline: 2px solid #2563a6; outline-offset: 1px; }
 .toolbar button:disabled { color: #9aa4b0; cursor: default; }
 .toolbar-divider { height: 1.5rem; width: 1px; background: #cbd3df; margin: 0 0.2rem; flex: none; }
-.editor-area { flex: 1; overflow: auto; padding: 1.5rem; }
+.editor-area { flex: 1; min-height: 0; overflow: auto; padding: 1.5rem; overscroll-behavior: contain; }
 .document { margin: 0 auto; background: #fff; box-shadow: 0 2px 15px #1a2a3e1a; }
 .editor-area--page .document { width: min(100%, 794px); min-height: 1123px; }
 .editor-area--mobile .document { width: min(100%, 680px); min-height: 70vh; }

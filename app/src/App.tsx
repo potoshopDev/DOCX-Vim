@@ -15,7 +15,6 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("mobile");
   const [documentId, setDocumentId] = useState<string>(() => crypto.randomUUID());
   const [documentName, setDocumentName] = useState("Новый документ");
-  const [warnings, setWarnings] = useState<string[]>([]);
   const [recovery, setRecovery] = useState<Draft[]>([]);
   const [ready, setReady] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -50,7 +49,7 @@ function App() {
       setReady(drafts.length === 0);
       currentReady.current = drafts.length === 0;
       setSaveStatus(drafts.length ? "Есть сохранённые черновики" : "Готово");
-    }).catch(() => { setReady(true); currentReady.current = true; setSaveStatus("Автосохранение недоступно"); });
+    }).catch(() => { setReady(true); currentReady.current = true; setSaveStatus(""); });
   }, []);
   useEffect(() => { editor?.setEditable(ready); }, [editor, ready]);
   useEffect(() => {
@@ -60,7 +59,7 @@ function App() {
       try {
         await writeDraft({ version: 1, id: documentId, name: documentName, document: editor.getJSON(), updatedAt: new Date().toISOString() });
         setSaveStatus(`Черновик сохранён ${new Date().toLocaleTimeString("ru-RU")}`);
-      } catch { setSaveStatus("Ошибка автосохранения"); }
+      } catch { setSaveStatus(""); }
     }, 800);
     return () => window.clearTimeout(timer);
   }, [editor, ready, revision, documentId, documentName]);
@@ -91,9 +90,8 @@ function App() {
 
   const startNew = async () => {
     if (!editor) return;
-    try { await persistCurrent(); } catch { setSaveStatus("Не удалось сохранить текущий черновик"); return; }
+    try { await persistCurrent(); } catch { setSaveStatus(""); return; }
     showDocument(crypto.randomUUID(), "Новый документ", "<p></p>");
-    setWarnings([]);
     setRecovery([]);
   };
 
@@ -104,10 +102,9 @@ function App() {
       const imported = await importDocx(bytes);
       await persistCurrent();
       showDocument(crypto.randomUUID(), name, imported.html || "<p></p>");
-      setWarnings(imported.warnings);
       setRecovery([]);
       setSaveStatus("Открыт документ; исходный файл не изменён");
-    } catch (error) { setSaveStatus(`Ошибка открытия: ${String(error)}`); }
+    } catch { setSaveStatus(""); }
     finally { setBusy(false); }
   };
 
@@ -120,7 +117,7 @@ function App() {
       const bytes = await readFile(selected);
       const name = selected.split(/[\\/]/).pop() ?? "Документ.docx";
       await loadBytes(bytes, name);
-    } catch (error) { setSaveStatus(`Ошибка выбора файла: ${String(error)}`); }
+    } catch { setSaveStatus(""); }
   };
 
   const saveDocument = async () => {
@@ -143,7 +140,7 @@ function App() {
       }
       await persistCurrent();
       setSaveStatus(`DOCX сохранён ${new Date().toLocaleTimeString("ru-RU")}`);
-    } catch (error) { setSaveStatus(`Ошибка сохранения: ${String(error)}`); }
+    } catch { setSaveStatus(""); }
     finally { setBusy(false); }
   };
   const active = useEditorState({
@@ -225,14 +222,6 @@ function App() {
           <button type="button" onClick={() => { setRecovery([]); setReady(true); currentReady.current = true; }}>Начать новый</button>
         </aside>
       )}
-      {warnings.length > 0 && (
-        <aside className="warning-banner" role="alert">
-          <strong>При импорте обнаружены элементы, которые могут быть потеряны при сохранении DOCX.</strong>
-          <ul>{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
-          <span>Исходный файл не перезаписывается: первое сохранение создаёт новый DOCX.</span>
-        </aside>
-      )}
-
       <div className="toolbar" role="toolbar" aria-label="Форматирование документа">
         <select
           aria-label="Стиль абзаца"
