@@ -54,7 +54,7 @@ button, select { font: inherit; }
 .tiptap .text-issue--grammar { text-decoration: underline wavy #3679c8 1.5px; text-underline-offset: 3px; }
 .correction-panel { flex-shrink: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 0.8rem; background: white; border-top: 1px solid #cbd3df; font-size: 0.85rem; }
 .correction-panel button { border: 1px solid #afbdcf; border-radius: 0.35rem; background: #f8fbff; padding: 0.3rem 0.55rem; cursor: pointer; }
-.correction-panel .correction-choice--active { border-color: #2d65ad; background: #dce9ff; }
+.correction-panel .correction-choice--active { border: 2px solid #174b9b; background: #c7dcff; font-weight: 700; }
 .completion-hint { color: #cfe3ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .status-bar { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 1rem; background: #22334b; color: white; font-size: 0.75rem; }
 .status-bar button { border: 0; background: transparent; color: white; text-decoration: underline; cursor: pointer; }

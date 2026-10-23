@@ -63,6 +63,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const selectedIssueRef = useRef<TextIssue | null>(null);
   const correctionIndexRef = useRef(0);
   const correctionRequest = useRef(0);
+  const correctionPendingRef = useRef(false);
+  const pendingCorrectionOffset = useRef(0);
   const ignoredIssues = useRef(new Set<string>());
   const completionRef = useRef<typeof completion>(null);
   const assistSettingsRef = useRef(assistSettings);
@@ -105,24 +107,48 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     selection: editor ? { anchor: editor.state.selection.anchor, head: editor.state.selection.head } : undefined,
     scrollTop: editorArea.current?.scrollTop,
   });
+  const cycleCorrection = (direction: 1 | -1): boolean => {
+    const issue = selectedIssueRef.current;
+    if (issue && correctionPendingRef.current) {
+      pendingCorrectionOffset.current += direction;
+      return true;
+    }
+    if (!issue?.suggestions.length) return false;
+    const next = (correctionIndexRef.current + direction + issue.suggestions.length) % issue.suggestions.length;
+    correctionIndexRef.current = next;
+    flushSync(() => setCorrectionIndex(next));
+    return true;
+  };
+  const acceptCorrection = (): boolean => {
+    const issue = selectedIssueRef.current;
+    if (!editor || !issue?.suggestions.length) return false;
+    if (editor.state.doc.textBetween(issue.from, issue.to) !== issue.word) {
+      selectedIssueRef.current = null;
+      setSelectedIssue(null);
+      return false;
+    }
+    const replacement = issue.suggestions[correctionIndexRef.current];
+    editor.chain().focus().insertContentAt({ from: issue.from, to: issue.to }, replacement).run();
+    correctionRequest.current++;
+    correctionPendingRef.current = false;
+    selectedIssueRef.current = null;
+    setSelectedIssue(null);
+    setCorrectionPending(false);
+    return true;
+  };
   const showCorrectionsAtCaret = (direction: 1 | -1) => {
     if (!editor) return;
     const target = wordAtCaret(editor.state);
-    if (!target) { selectedIssueRef.current = null; setSelectedIssue(null); setCorrectionPending(false); return; }
-    const current = selectedIssueRef.current;
-    if (current?.from === target.from && current.to === target.to && current.suggestions.length) {
-      const next = (correctionIndexRef.current + direction + current.suggestions.length) % current.suggestions.length;
-      correctionIndexRef.current = next;
-      flushSync(() => setCorrectionIndex(next));
-      return;
-    }
+    if (!target) { selectedIssueRef.current = null; correctionPendingRef.current = false; setSelectedIssue(null); setCorrectionPending(false); return; }
     const issue = issuesRef.current.find((item) => item.from === target.from && item.to === target.to);
     if (issue?.kind === "grammar") {
       selectedIssueRef.current = issue;
       setSelectedIssue(issue);
+      correctionPendingRef.current = false;
       setCorrectionPending(false);
-      correctionIndexRef.current = 0;
-      setCorrectionIndex(0);
+      const initialIndex = direction === -1 ? Math.max(0, issue.suggestions.length - 1) : 0;
+      correctionIndexRef.current = initialIndex;
+      setCorrectionIndex(initialIndex);
       return;
     }
     const request = ++correctionRequest.current;
@@ -130,6 +156,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const language: Language = /[А-Яа-яЁё]/.test(target.word) ? "ru" : "en";
     const pending: TextIssue = issue ?? { ...target, kind: "spelling", suggestions: [] };
     selectedIssueRef.current = pending;
+    correctionPendingRef.current = true;
+    pendingCorrectionOffset.current = direction === -1 ? -1 : 0;
     flushSync(() => { setSelectedIssue(pending); setCorrectionPending(true); });
     void askWorker({ type: "suggest", word: target.word, language, personal: personalRef.current })
       .then((result: { suggestions?: string[]; correct?: boolean }) => {
@@ -137,13 +165,17 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           editor.state.doc.textBetween(target.from, target.to) !== target.word) return;
         if (result.correct) {
           selectedIssueRef.current = null;
+          correctionPendingRef.current = false;
           flushSync(() => { setSelectedIssue(null); setCorrectionPending(false); });
           return;
         }
         const next = { ...pending, suggestions: result.suggestions ?? [] };
         selectedIssueRef.current = next;
-        correctionIndexRef.current = 0;
-        flushSync(() => { setSelectedIssue(next); setCorrectionIndex(0); setCorrectionPending(false); });
+        correctionPendingRef.current = false;
+        const index = next.suggestions.length
+          ? (pendingCorrectionOffset.current % next.suggestions.length + next.suggestions.length) % next.suggestions.length : 0;
+        correctionIndexRef.current = index;
+        flushSync(() => { setSelectedIssue(next); setCorrectionIndex(index); setCorrectionPending(false); });
       });
   };
   const stableExtensions = useMemo(() => [...editorExtensions, VimExtension, TextCheck], []);
@@ -158,16 +190,15 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         if (correctionKey) {
           event.preventDefault();
           event.stopPropagation();
-          showCorrectionsAtCaret(correctionKey as 1 | -1);
+          const direction = correctionKey as 1 | -1;
+          if (!cycleCorrection(direction)) showCorrectionsAtCaret(direction);
           return true;
         }
         const correction = selectedIssueRef.current;
         if (event.key === "Tab" && correction?.suggestions.length) {
           event.preventDefault();
-          const replacement = correction.suggestions[correctionIndexRef.current];
-          editor?.chain().focus().insertContentAt({ from: correction.from, to: correction.to }, replacement).run();
-          selectedIssueRef.current = null;
-          setSelectedIssue(null);
+          event.stopPropagation();
+          acceptCorrection();
           return true;
         }
         if (event.key === "Tab" && (!editable || !completionRef.current)) {
@@ -181,6 +212,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           event.preventDefault();
           correctionRequest.current++;
           selectedIssueRef.current = null;
+          correctionPendingRef.current = false;
           setSelectedIssue(null);
           setCorrectionPending(false);
           return true;
@@ -215,6 +247,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       handleClick: (_view, pos) => {
         const issue = issuesRef.current.find((item) => item.from <= pos && pos <= item.to);
         selectedIssueRef.current = issue ?? null;
+        correctionPendingRef.current = false;
         setSelectedIssue(issue ?? null);
         setCorrectionPending(false);
         correctionIndexRef.current = 0;
@@ -251,6 +284,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       if (!suppressUpdate.current) {
         correctionRequest.current++;
         selectedIssueRef.current = null;
+        correctionPendingRef.current = false;
         setSelectedIssue(null);
         setCorrectionPending(false);
         setRevision((value) => value + 1);
@@ -262,6 +296,33 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       if (transaction.selectionSet || transaction.docChanged) setSelectionRevision((value) => value + 1);
     },
   });
+  useEffect(() => {
+    if (!selectedIssue || !editor) return;
+    const onCorrectionKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target !== editor.view.dom &&
+        !editor.view.dom.contains(target) && target.closest("input, textarea, [contenteditable='true']")) return;
+      const direction = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
+        ? event.code === "KeyN" || ["n", "N", "т", "Т"].includes(event.key) ? 1
+          : event.code === "KeyP" || ["p", "P", "з", "З"].includes(event.key) ? -1 : 0
+        : 0;
+      if (direction) {
+        if (!cycleCorrection(direction as 1 | -1)) return;
+      } else if (event.key === "Tab") {
+        if (!correctionPendingRef.current && !acceptCorrection()) return;
+      } else if (event.key === "Escape") {
+        correctionRequest.current++;
+        correctionPendingRef.current = false;
+        selectedIssueRef.current = null;
+        setSelectedIssue(null);
+        setCorrectionPending(false);
+      } else return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    window.addEventListener("keydown", onCorrectionKeyDown, true);
+    return () => window.removeEventListener("keydown", onCorrectionKeyDown, true);
+  }, [editor, selectedIssue]);
   useEffect(() => {
     const worker = new Worker(new URL("./text-check.worker.ts", import.meta.url), { type: "module" });
     checkWorker.current = worker;
@@ -731,6 +792,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         <span>{selectedIssue.message || `Слово «${selectedIssue.word}» не найдено в словаре`}</span>
         {correctionPending && <span>Подбираем варианты…</span>}
         {!correctionPending && !selectedIssue.suggestions.length && <span>Вариантов нет</span>}
+        {selectedIssue.suggestions.length > 0 && <span>Вариант {correctionIndex + 1}/{selectedIssue.suggestions.length} · Ctrl+N/P — выбор · Tab — вставить</span>}
         {selectedIssue.suggestions.map((word, index) => <button type="button" key={`${word}-${index}`}
           className={index === correctionIndex ? "correction-choice--active" : ""} aria-pressed={index === correctionIndex}
           onClick={() => replaceIssue(word)}>{word}</button>)}
