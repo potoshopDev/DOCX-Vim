@@ -1,6 +1,8 @@
 import type { Editor, JSONContent } from "@tiptap/core";
 import { vimPluginKey } from "vim-prosemirror";
 import { Selection, TextSelection } from "@tiptap/pm/state";
+import { isTauri } from "@tauri-apps/api/core";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 const russian = "йцукенгшщзхъфывапролджэячсмитьбю";
 const english = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
@@ -14,6 +16,7 @@ function commandKey(event: KeyboardEvent): string {
     return event.shiftKey ? letter.toUpperCase() : letter;
   }
   if (event.code === "Semicolon" && event.shiftKey) return ":";
+  if (event.code === "Quote" && event.shiftKey) return '"';
   if (event.code === "Digit4" && event.shiftKey) return "$";
   if (event.code === "Slash" && !event.shiftKey) return "/";
   const index = russian.indexOf(event.key.toLowerCase());
@@ -28,6 +31,8 @@ function withKey(event: KeyboardEvent, key: string): void {
 
 export class VimAdapter {
   private windowPending = false;
+  private registerPrefix: "quote" | "plus" | null = null;
+  private plusYank: { origin: number; count: number } | null = null;
   private backwardSearch = false;
   private preferredX: number | null = null;
   private ownClipboard: string | null = null;
@@ -44,6 +49,8 @@ export class VimAdapter {
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
     this.windowPending = false;
+    this.registerPrefix = null;
+    this.plusYank = null;
     const state = vimPluginKey.getState(this.editor.state);
     if (!state) return;
     state.mode = enabled ? "normal" : "insert";
@@ -51,6 +58,65 @@ export class VimAdapter {
     state.operator = null;
     state.searchActive = false;
     this.editor.view.dispatch(this.editor.state.tr);
+  }
+
+  private async writeSharedClipboard(value: string): Promise<void> {
+    try {
+      if (isTauri()) await writeText(value);
+      else await navigator.clipboard.writeText(value);
+    } catch { /* Clipboard permissions vary outside Tauri. */ }
+  }
+
+  private async readSharedClipboard(): Promise<string | null> {
+    try { return isTauri() ? await readText() : await navigator.clipboard.readText(); }
+    catch { return null; }
+  }
+
+  private finishPlusYank(from: number, to: number, linewise = false): void {
+    const view = this.editor.view;
+    const state = view.state;
+    const text = state.doc.textBetween(Math.min(from, to), Math.max(from, to), "\n", "\n") + (linewise ? "\n" : "");
+    void this.writeSharedClipboard(text);
+    const vim = vimPluginKey.getState(state);
+    const origin = this.plusYank?.origin ?? state.selection.from;
+    this.plusYank = null;
+    if (vim) {
+      vim.mode = "normal"; vim.visualAnchor = null; vim.visualHead = null;
+      vim.count = null; vim.operator = null;
+    }
+    const $origin = state.doc.resolve(Math.min(origin, state.doc.content.size));
+    const pos = $origin.parent.isTextblock ? $origin.pos
+      : (Selection.findFrom($origin, 1, true) ?? Selection.findFrom($origin, -1, true))?.$from.pos ?? 1;
+    view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, pos)));
+  }
+
+  private copyLine(count: number): void {
+    const state = this.editor.state;
+    const $head = state.doc.resolve(this.plusYank?.origin ?? state.selection.head);
+    const from = $head.before($head.depth);
+    let to = $head.after($head.depth);
+    for (let index = 1; index < count; index++) {
+      const next = Selection.findFrom(state.doc.resolve(Math.min(to, state.doc.content.size)), 1, true);
+      if (!next || next.$from.pos <= $head.pos) break;
+      to = next.$from.after(next.$from.depth);
+    }
+    this.finishPlusYank(from, to, true);
+  }
+
+  private async pasteSharedClipboard(before: boolean, count: number): Promise<void> {
+    const text = await this.readSharedClipboard();
+    if (!text) return;
+    const view = this.editor.view;
+    const state = view.state;
+    const $head = state.selection.$head;
+    const pos = state.selection.empty
+      ? Math.min($head.pos + (before ? 0 : 1), $head.end($head.depth))
+      : state.selection.from;
+    if (state.selection.empty) view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, pos)));
+    view.focus();
+    view.pasteText(text.repeat(Math.min(count, 999)));
+    const vim = vimPluginKey.getState(view.state);
+    if (vim) { vim.mode = "normal"; vim.count = null; view.dispatch(view.state.tr); }
   }
 
   private openLines(count: number, above: boolean): void {
@@ -205,6 +271,75 @@ export class VimAdapter {
       event.preventDefault();
       this.windowCommand(key);
       return true;
+    }
+    if (this.plusYank) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        const origin = this.plusYank.origin;
+        this.plusYank = null;
+        state.mode = "normal"; state.visualAnchor = null; state.visualHead = null;
+        this.editor.view.dispatch(this.editor.state.tr.setSelection(TextSelection.create(this.editor.state.doc, origin)));
+        return true;
+      }
+      if (key === "y") { event.preventDefault(); this.copyLine(this.plusYank.count); return true; }
+      if (key === "j" || key === "k") {
+        event.preventDefault();
+        let target = this.plusYank.origin;
+        for (let index = 0; index < this.plusYank.count; index++) target = this.moveScreenRow(target, key === "j" ? 1 : -1);
+        this.finishPlusYank(this.plusYank.origin, target);
+        return true;
+      }
+      const wasTextObject = Boolean((state as typeof state & { _textObjectType?: string })._textObjectType);
+      withKey(event, key);
+      queueMicrotask(() => {
+        if (!this.plusYank) return;
+        const current = vimPluginKey.getState(this.editor.state);
+        if (!current || current.mode !== "visual") { this.plusYank = null; return; }
+        if (current.ggPending || current.findPending || (current as typeof current & { _textObjectType?: string })._textObjectType) return;
+        const origin = this.plusYank.origin;
+        const head = current.visualHead ?? origin;
+        const selection = this.editor.state.selection;
+        let from = selection.from; let to = selection.to;
+        if (!wasTextObject && ["w", "W", "b", "B", "0", "^", "$", "g"].includes(key)) {
+          from = Math.min(origin, head);
+          to = Math.max(origin, head);
+        }
+        this.finishPlusYank(from, to);
+      });
+      return false;
+    }
+    if (key === '"') {
+      event.preventDefault(); this.registerPrefix = "quote"; return true;
+    }
+    if (this.registerPrefix === "quote") {
+      event.preventDefault();
+      this.registerPrefix = key === "+" ? "plus" : null;
+      return true;
+    }
+    if (this.registerPrefix === "plus") {
+      if (/^[0-9]$/.test(key)) { withKey(event, key); return false; }
+      this.registerPrefix = null;
+      if (key === "p" || key === "P") {
+        event.preventDefault();
+        const count = state.count ?? 1;
+        state.count = null;
+        void this.pasteSharedClipboard(key === "P", count);
+        return true;
+      }
+      if (key === "y") {
+        event.preventDefault();
+        if (state.mode === "visual" || state.mode === "visual-line") {
+          this.finishPlusYank(this.editor.state.selection.from, this.editor.state.selection.to,
+            state.mode === "visual-line");
+        } else {
+          const origin = this.editor.state.selection.head;
+          this.plusYank = { origin, count: state.count ?? 1 };
+          state.mode = "visual"; state.visualAnchor = origin; state.visualHead = origin;
+          this.editor.view.dispatch(this.editor.state.tr.setSelection(TextSelection.create(this.editor.state.doc, origin,
+            Math.min(origin + 1, this.editor.state.doc.content.size))));
+        }
+        return true;
+      }
     }
     if (key === ":") {
       event.preventDefault();

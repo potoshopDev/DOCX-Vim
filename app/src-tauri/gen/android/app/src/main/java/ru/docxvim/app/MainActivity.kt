@@ -25,6 +25,13 @@ open class MainActivity : TauriActivity() {
     manager.appTasks.firstOrNull { it.taskInfo?.taskId == savedTaskId }?.moveToFront()
   }
 
+  fun closeDocxTask(documentId: String, _name: String) {
+    if (this !is DocumentActivity) return
+    getSharedPreferences("docx_tasks", MODE_PRIVATE).edit().remove(documentId).apply()
+    focusDocxTask("main", "")
+    finishAndRemoveTask()
+  }
+
   @Deprecated("Required to retain access to documents selected by the system picker")
   override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
     if (resultCode == Activity.RESULT_OK && data?.data != null) {

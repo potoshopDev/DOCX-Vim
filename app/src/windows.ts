@@ -3,6 +3,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { emitTo } from "@tauri-apps/api/event";
 
 const labelFor = (id: string) => `doc-${id}`;
 export const routeDocumentId = () => new URLSearchParams(location.search).get("doc");
@@ -20,7 +21,7 @@ export async function openDocumentWindow(id: string, name: string, duplicate = f
   if (existing) {
     if (android) await invoke("focus_task", { id: existing.label.slice(4) });
     else { await existing.show(); await existing.setFocus(); }
-    await existing.emit("focus-editor");
+    await emitTo(existing.label, "focus-editor");
     return;
   }
   try {
@@ -51,7 +52,7 @@ export async function focusAdjacentWindow(direction: number): Promise<void> {
   const target = windows[(index + direction + windows.length) % windows.length];
   if (/Android/i.test(navigator.userAgent)) await invoke("focus_task", { id: target.label.slice(4) });
   else { await target.show(); await target.setFocus(); }
-  await target.emit("focus-editor");
+  await emitTo(target.label, "focus-editor");
 }
 
 export async function isDocumentSaveOwner(id: string): Promise<boolean> {

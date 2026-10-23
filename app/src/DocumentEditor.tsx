@@ -8,7 +8,7 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { exportDocx } from "./docx";
 import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
-import { readDraft, type Draft } from "./draft";
+import { readDraft, writeDraft, type Draft } from "./draft";
 import { editorExtensions } from "./editor-extensions";
 import { readSettings } from "./settings";
 import { VimMode as VimExtension, getVimMode } from "vim-prosemirror/tiptap";
@@ -117,9 +117,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   useEffect(() => {
     if (!editor || !ready) return;
     const channel = new BroadcastChannel(`docx-vim-${documentId}`);
+    const android = isTauri() && /Android/i.test(navigator.userAgent);
     documentChannel.current = channel;
     channel.onmessage = (event: MessageEvent<{ type: string; document?: Draft["document"]; savePath?: string }>) => {
-      if (event.data.type === "active") { editor.setEditable(false); return; }
+      if (event.data.type === "active") { if (!android) editor.setEditable(false); return; }
       if (event.data.type === "save-request") {
         void isDocumentSaveOwner(documentId).then((owner) => {
           if (!owner) return;
@@ -139,13 +140,25 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       setRevision((value) => value + 1);
     };
     const onFocus = () => {
+      if (!android && document.visibilityState === "hidden") return;
       editor.setEditable(true);
       channel.postMessage({ type: "active" });
       setRevision((value) => value + 1);
+      requestAnimationFrame(() => editor.commands.focus());
     };
+    const onVisible = () => { if (document.visibilityState === "visible") onFocus(); };
     addEventListener("focus", onFocus);
-    if (document.hasFocus()) onFocus();
-    return () => { removeEventListener("focus", onFocus); channel.close(); documentChannel.current = null; };
+    document.addEventListener("visibilitychange", onVisible);
+    const resumed = android ? getCurrentWindow().listen("tauri://resumed", onFocus) : null;
+    const focusEditor = isTauri() ? getCurrentWindow().listen("focus-editor", onFocus) : null;
+    if (android || document.hasFocus()) onFocus();
+    return () => {
+      removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisible);
+      if (resumed) void resumed.then((unlisten) => unlisten());
+      if (focusEditor) void focusEditor.then((unlisten) => unlisten());
+      channel.close(); documentChannel.current = null;
+    };
   }, [editor, ready, documentId]);
   useEffect(() => {
     if (!editor) return;
@@ -167,13 +180,6 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     return () => removeEventListener("focus", refreshSettings);
   }, [editor]);
   useEffect(() => {
-    if (!isTauri() || !editor) return;
-    const listener = getCurrentWindow().listen("focus-editor", () => {
-      if (currentReady.current) requestAnimationFrame(() => editor.commands.focus());
-    });
-    return () => { void listener.then((unlisten) => unlisten()); };
-  }, [editor]);
-  useEffect(() => {
     if (!editor || !ready) return;
     setSaveStatus("Сохранение в фоне…");
     void isDocumentSaveOwner(documentId).then((owner) => {
@@ -184,6 +190,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const persistCurrent = async (draftIsEnough = false) => {
     if (!editor || !currentReady.current) return;
     if (!(await isDocumentSaveOwner(documentId)) && documentChannel.current) {
+      await writeDraft(currentDraft());
       documentChannel.current.postMessage({ type: "save-request", savePath: currentSavePath.current });
       return;
     }
@@ -197,8 +204,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const listener = onBackButtonPress(() => {
       void (async () => {
         try { await persistCurrent(true); } catch { return; }
-        await showLibrary();
-        if (getCurrentWindow().label !== "main") await getCurrentWindow().destroy();
+        if (getCurrentWindow().label.startsWith("doc-")) await invoke("close_task");
+        else await showLibrary();
       })();
     });
     return () => { void listener.then((handle) => handle.unregister()); };
@@ -268,6 +275,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
 
   const quitDocument = async (): Promise<void> => {
     try { await persistCurrent(true); } catch { return; }
+    if (isTauri() && /Android/i.test(navigator.userAgent) && getCurrentWindow().label.startsWith("doc-")) {
+      await invoke("close_task");
+      return;
+    }
     await showLibrary();
     if (isTauri() && getCurrentWindow().label !== "main") await getCurrentWindow().destroy();
   };

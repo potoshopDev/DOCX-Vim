@@ -28,10 +28,22 @@ fn focus_task(window: tauri::WebviewWindow, id: String) -> Result<(), String> {
     { let _ = (window, id); Ok(()) }
 }
 
+#[tauri::command]
+fn close_task(window: tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let id = window.label().strip_prefix("doc-").ok_or("Not a document task")?.to_string();
+        android_task_method(window, "closeDocxTask", id, String::new())
+    }
+    #[cfg(not(target_os = "android"))]
+    { let _ = window; Ok(()) }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![register_task, focus_task])
+        .invoke_handler(tauri::generate_handler![register_task, focus_task, close_task])
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
