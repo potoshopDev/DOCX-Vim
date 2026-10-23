@@ -1,6 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import { isTauri } from "@tauri-apps/api/core";
-import { BaseDirectory, mkdir, readDir, readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { BaseDirectory, mkdir, readDir, readTextFile, rename, writeTextFile } from "@tauri-apps/plugin-fs";
 
 export type Draft = {
   version: 1;
@@ -9,6 +9,7 @@ export type Draft = {
   document: JSONContent;
   updatedAt: string;
   sourcePath?: string;
+  savePath?: string;
 };
 const directory = "drafts";
 const key = (id: string) => `docx-vim-draft-${id}`;
@@ -49,6 +50,9 @@ export async function writeDraft(draft: Draft): Promise<void> {
   const raw = JSON.stringify(draft);
   if (isTauri()) {
     await mkdir(directory, { baseDir: BaseDirectory.AppData, recursive: true });
-    await writeTextFile(path(draft.id), raw, { baseDir: BaseDirectory.AppData });
+    const destination = path(draft.id);
+    const temporary = `${destination}.tmp`;
+    await writeTextFile(temporary, raw, { baseDir: BaseDirectory.AppData });
+    await rename(temporary, destination, { oldPathBaseDir: BaseDirectory.AppData, newPathBaseDir: BaseDirectory.AppData });
   } else localStorage.setItem(key(draft.id), raw);
 }

@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import { isTauri } from "@tauri-apps/api/core";
+import { basename } from "@tauri-apps/api/path";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { readFile, writeFile } from "@tauri-apps/plugin-fs";
+import { readFile } from "@tauri-apps/plugin-fs";
 import StarterKit from "@tiptap/starter-kit";
 import TextAlign from "@tiptap/extension-text-align";
 import { exportDocx, importDocx } from "./docx";
-import { listDrafts, writeDraft, type Draft } from "./draft";
+import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
+import { listDrafts, type Draft } from "./draft";
 import "./App.css";
 
 type ViewMode = "page" | "mobile";
@@ -24,7 +27,18 @@ function App() {
   const suppressUpdate = useRef(false);
   const currentId = useRef(documentId);
   const currentName = useRef(documentName);
+  const currentSourcePath = useRef<string | undefined>(undefined);
+  const currentSavePath = useRef<string | undefined>(undefined);
   const currentReady = useRef(false);
+  const saver = useRef<BackgroundSaver | null>(null);
+  if (!saver.current) saver.current = new BackgroundSaver((id, path) => {
+    if (id === currentId.current) setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
+  });
+  const currentDraft = (): Draft => ({
+    version: 1, id: currentId.current, name: currentName.current,
+    document: editor!.getJSON(), updatedAt: new Date().toISOString(),
+    sourcePath: currentSourcePath.current, savePath: currentSavePath.current,
+  });
   const editor = useEditor({
     extensions: [
       StarterKit.configure({ link: { openOnClick: false } }),
@@ -54,28 +68,57 @@ function App() {
   useEffect(() => { editor?.setEditable(ready); }, [editor, ready]);
   useEffect(() => {
     if (!editor || !ready) return;
-    setSaveStatus("Изменения в черновике…");
-    const timer = window.setTimeout(async () => {
-      try {
-        await writeDraft({ version: 1, id: documentId, name: documentName, document: editor.getJSON(), updatedAt: new Date().toISOString() });
-        setSaveStatus(`Черновик сохранён ${new Date().toLocaleTimeString("ru-RU")}`);
-      } catch { setSaveStatus(""); }
-    }, 800);
-    return () => window.clearTimeout(timer);
+    setSaveStatus("Сохранение в фоне…");
+    saver.current!.schedule(currentDraft());
   }, [editor, ready, revision, documentId, documentName]);
 
-  const persistCurrent = async () => {
+  const persistCurrent = async (draftIsEnough = false) => {
     if (!editor || !currentReady.current) return;
-    await writeDraft({ version: 1, id: currentId.current, name: currentName.current, document: editor.getJSON(), updatedAt: new Date().toISOString() });
+    try { await saver.current!.flush(currentDraft()); }
+    catch (error) {
+      if (!draftIsEnough || !(error instanceof BackgroundSaveFailure && error.draftSaved)) throw error;
+    }
   };
+  useEffect(() => {
+    if (!editor) return;
+    const saveWhenHidden = () => {
+      if (document.visibilityState === "hidden" && currentReady.current) {
+        void saver.current!.flush(currentDraft()).catch(() => {});
+      }
+    };
+    document.addEventListener("visibilitychange", saveWhenHidden);
+    if (!isTauri() || /Android/i.test(navigator.userAgent)) {
+      return () => document.removeEventListener("visibilitychange", saveWhenHidden);
+    }
+    const windowHandle = getCurrentWindow();
+    let closing = false;
+    const listener = windowHandle.onCloseRequested(async (event) => {
+      if (!currentReady.current || closing) return;
+      event.preventDefault();
+      closing = true;
+      try {
+        await persistCurrent(true);
+        await windowHandle.destroy();
+      } catch {
+        closing = false;
+        setSaveStatus("");
+      }
+    }).catch(() => () => {});
+    return () => {
+      document.removeEventListener("visibilitychange", saveWhenHidden);
+      void listener.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, [editor]);
 
-  const showDocument = (id: string, name: string, content: string | Draft["document"]) => {
+  const showDocument = (id: string, name: string, content: string | Draft["document"], paths: Pick<Draft, "sourcePath" | "savePath"> = {}) => {
     if (!editor) return;
     suppressUpdate.current = true;
     editor.commands.setContent(content);
     suppressUpdate.current = false;
     currentId.current = id;
     currentName.current = name;
+    currentSourcePath.current = paths.sourcePath;
+    currentSavePath.current = paths.savePath;
     setDocumentId(id);
     setDocumentName(name);
     setReady(true);
@@ -84,24 +127,24 @@ function App() {
   };
 
   const restoreDraft = (draft: Draft) => {
-    showDocument(draft.id, draft.name, draft.document);
+    showDocument(draft.id, draft.name, draft.document, draft);
     setRecovery([]);
   };
 
   const startNew = async () => {
     if (!editor) return;
-    try { await persistCurrent(); } catch { setSaveStatus(""); return; }
+    try { await persistCurrent(true); } catch { setSaveStatus(""); return; }
     showDocument(crypto.randomUUID(), "Новый документ", "<p></p>");
     setRecovery([]);
   };
 
-  const loadBytes = async (bytes: Uint8Array, name: string) => {
+  const loadBytes = async (bytes: Uint8Array, name: string, sourcePath?: string) => {
     if (!editor) return;
     setBusy(true);
     try {
       const imported = await importDocx(bytes);
-      await persistCurrent();
-      showDocument(crypto.randomUUID(), name, imported.html || "<p></p>");
+      await persistCurrent(true);
+      showDocument(crypto.randomUUID(), name, imported.html || "<p></p>", { sourcePath });
       setRecovery([]);
       setSaveStatus("Открыт документ; исходный файл не изменён");
     } catch { setSaveStatus(""); }
@@ -115,8 +158,8 @@ function App() {
       const selected = await open({ multiple: false, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
       if (typeof selected !== "string") return;
       const bytes = await readFile(selected);
-      const name = selected.split(/[\\/]/).pop() ?? "Документ.docx";
-      await loadBytes(bytes, name);
+      const name = await basename(selected).catch(() => selected.split(/[\\/]/).pop() ?? "Документ.docx");
+      await loadBytes(bytes, name, selected);
     } catch { setSaveStatus(""); }
   };
 
@@ -124,22 +167,26 @@ function App() {
     if (!editor || busy || !ready) return;
     setBusy(true);
     try {
-      const blob = await exportDocx(editor.getJSON());
-      const suggestedName = documentName.toLowerCase().endsWith(".docx") ? documentName : `${documentName}.docx`;
+      const baseName = documentName.replace(/\.docx$/i, "");
+      const suggestedName = `${baseName}${currentSourcePath.current && !currentSavePath.current ? " (DOCX Vim)" : ""}.docx`;
       if (isTauri()) {
-        const selected = await save({ defaultPath: suggestedName, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
-        if (!selected) return;
-        await writeFile(selected, new Uint8Array(await blob.arrayBuffer()));
+        if (!currentSavePath.current) {
+          const selected = await save({ defaultPath: suggestedName, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
+          if (!selected) return;
+          currentSavePath.current = selected;
+        }
+        await persistCurrent();
       } else {
+        const blob = await exportDocx(editor.getJSON());
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement("a");
         anchor.href = url;
         anchor.download = suggestedName;
         anchor.click();
         window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        await persistCurrent();
       }
-      await persistCurrent();
-      setSaveStatus(`DOCX сохранён ${new Date().toLocaleTimeString("ru-RU")}`);
+      if (!isTauri()) setSaveStatus(`DOCX сохранён ${new Date().toLocaleTimeString("ru-RU")}`);
     } catch { setSaveStatus(""); }
     finally { setBusy(false); }
   };
