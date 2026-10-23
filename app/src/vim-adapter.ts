@@ -29,13 +29,13 @@ function withKey(event: KeyboardEvent, key: string): void {
 export class VimAdapter {
   private windowPending = false;
   private backwardSearch = false;
-  private backwardSearchInput = false;
+  private preferredX: number | null = null;
   private ownClipboard: string | null = null;
   private ownContent: JSONContent[] | null = null;
   private lastWordAction: { operator: "d" | "c"; object: "w" | "W"; around: boolean } | null = null;
   enabled = true;
   constructor(private editor: Editor, private windowCommand: (key: string) => void,
-    private commandInput: () => void) {}
+    private commandInput: () => void, private searchInput: (backward: boolean) => void) {}
 
   mode(): VimMode {
     return (vimPluginKey.getState(this.editor.state)?.mode ?? "normal") as VimMode;
@@ -70,7 +70,7 @@ export class VimAdapter {
     view.dispatch(tr.scrollIntoView());
   }
 
-  private searchBackwards(query: string): void {
+  submitSearch(query: string, backward: boolean): void {
     if (!query) return;
     const view = this.editor.view;
     const state = view.state;
@@ -89,12 +89,58 @@ export class VimAdapter {
       vim.searchTerm = query;
       vim.searchWholeWord = false;
       vim.searchHighlightsVisible = true;
-      this.backwardSearch = true;
+      this.backwardSearch = backward;
     }
     const head = state.selection.head;
-    const previous = hits.filter((pos) => pos < head).pop() ?? hits[hits.length - 1];
-    if (previous !== undefined) view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, previous)).scrollIntoView());
+    const target = backward ? hits.filter((pos) => pos < head).pop() ?? hits[hits.length - 1]
+      : hits.find((pos) => pos > head) ?? hits[0];
+    if (target !== undefined) view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, target)).scrollIntoView());
     else view.dispatch(state.tr);
+  }
+
+  private lineBounds(pos: number): { from: number; to: number } {
+    const view = this.editor.view;
+    const $pos = view.state.doc.resolve(pos);
+    const start = $pos.start($pos.depth);
+    const end = $pos.end($pos.depth);
+    const top = view.coordsAtPos(pos).top;
+    const sameRow = (at: number) => Math.abs(view.coordsAtPos(at).top - top) < 2;
+    let low = start; let high = pos;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (sameRow(mid)) high = mid; else low = mid + 1;
+    }
+    const from = low;
+    low = pos; high = end;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (sameRow(mid)) low = mid; else high = mid - 1;
+    }
+    return { from, to: low };
+  }
+
+  private moveScreenRow(pos: number, direction: number): number {
+    const view = this.editor.view;
+    const rect = view.coordsAtPos(pos);
+    const lineHeight = Number.parseFloat(getComputedStyle(view.dom).lineHeight) || rect.bottom - rect.top || 24;
+    const x = this.preferredX ?? rect.left;
+    this.preferredX = x;
+    for (let step = 1; step <= 5; step++) {
+      const target = view.posAtCoords({ left: x, top: (direction > 0 ? rect.bottom : rect.top) + direction * lineHeight * (step - 0.5) });
+      if (!target) continue;
+      const targetTop = view.coordsAtPos(target.pos).top;
+      if (direction * (targetTop - rect.top) > 2) return target.pos;
+    }
+    return pos;
+  }
+
+  private screenSelection(anchor: number, head: number): void {
+    const state = this.editor.state;
+    const a = this.lineBounds(anchor);
+    const h = this.lineBounds(head);
+    const from = Math.min(a.from, h.from);
+    const to = Math.max(a.to, h.to);
+    this.editor.view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, from, to)).scrollIntoView());
   }
 
   private wordObject(object: "w" | "W", around: boolean, operator: "d" | "c" | "y", count: number): boolean {
@@ -144,16 +190,6 @@ export class VimAdapter {
       if (event.key === "Escape") { event.preventDefault(); return true; }
       return false;
     }
-    if (state.searchActive && this.backwardSearchInput && (event.key === "Enter" || event.key === "Escape")) {
-      event.preventDefault();
-      const query = state.searchQuery;
-      this.backwardSearchInput = false;
-      const prefix = this.editor.view.dom.parentElement?.querySelector(".vim-search-prefix");
-      if (prefix) prefix.textContent = "/";
-      if (event.key === "Enter" && query) this.searchBackwards(query);
-      else { state.searchActive = false; state.searchQuery = ""; this.editor.view.dispatch(this.editor.state.tr); }
-      return true;
-    }
     if (event.isComposing || state.searchActive || state.mode === "insert" || state.mode === "replace") return false;
     if (event.ctrlKey && !event.altKey && (event.code === "KeyW" || /[wц]/i.test(event.key))) {
       this.windowPending = true; event.preventDefault(); return true;
@@ -171,17 +207,41 @@ export class VimAdapter {
       this.commandInput();
       return true;
     }
-    if (key === "?") {
+    if (key === "?" || key === "/") {
       event.preventDefault();
-      this.backwardSearchInput = true;
-      state.searchActive = true;
-      state.searchQuery = "";
-      const prefix = this.editor.view.dom.parentElement?.querySelector(".vim-search-prefix");
-      if (prefix) prefix.textContent = "?";
-      this.editor.view.dispatch(this.editor.state.tr);
+      this.searchInput(key === "?");
       return true;
     }
-    if (key === "/") this.backwardSearch = false;
+    if (key === "V" && state.operator === null) {
+      event.preventDefault();
+      if (state.mode === "visual-line") {
+        state.mode = "normal"; state.visualAnchor = null; state.visualHead = null;
+        this.editor.view.dispatch(this.editor.state.tr.setSelection(TextSelection.create(this.editor.state.doc, this.editor.state.selection.from)));
+      } else {
+        const pos = state.visualHead ?? this.editor.state.selection.head;
+        state.mode = "visual-line"; state.visualAnchor = pos; state.visualHead = pos;
+        this.screenSelection(pos, pos);
+      }
+      return true;
+    }
+    if ((key === "j" || key === "k") && state.operator === null) {
+      event.preventDefault();
+      const count = Math.min(state.count ?? 1, 999);
+      let pos = state.visualHead ?? this.editor.state.selection.head;
+      for (let index = 0; index < count; index++) pos = this.moveScreenRow(pos, key === "j" ? 1 : -1);
+      state.count = null;
+      if (state.mode === "visual-line" && state.visualAnchor !== null) {
+        state.visualHead = pos;
+        this.screenSelection(state.visualAnchor, pos);
+      } else if (state.mode === "visual" && state.visualAnchor !== null) {
+        state.visualHead = pos;
+        const from = Math.min(state.visualAnchor, pos);
+        const to = Math.min(this.editor.state.doc.content.size, Math.max(state.visualAnchor, pos) + 1);
+        this.editor.view.dispatch(this.editor.state.tr.setSelection(TextSelection.create(this.editor.state.doc, from, to)).scrollIntoView());
+      } else this.editor.view.dispatch(this.editor.state.tr.setSelection(TextSelection.create(this.editor.state.doc, pos)).scrollIntoView());
+      return true;
+    }
+    if (key !== "j" && key !== "k") this.preferredX = null;
     if (this.backwardSearch && (key === "n" || key === "N")) {
       withKey(event, key === "n" ? "N" : "n");
       return false;
@@ -211,6 +271,13 @@ export class VimAdapter {
       return true;
     }
     if (key === "d" || key === "c" || key === "y") { this.ownClipboard = null; this.ownContent = null; }
+    if (state.mode === "visual-line" && state.visualAnchor !== null) {
+      queueMicrotask(() => {
+        const current = vimPluginKey.getState(this.editor.state);
+        if (current?.mode === "visual-line" && current.visualAnchor !== null && current.visualHead !== null)
+          this.screenSelection(current.visualAnchor, current.visualHead);
+      });
+    }
     withKey(event, key);
     return false;
   }

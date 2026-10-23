@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { emitTo, listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { exportDocx } from "./docx";
 import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
@@ -29,8 +31,11 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [vimMode, setVimMode] = useState<VimMode>("normal");
   const [showHeadings, setShowHeadings] = useState(false);
   const [commandLine, setCommandLine] = useState<string | null>(null);
+  const [searchLine, setSearchLine] = useState<{ backward: boolean; query: string } | null>(null);
   const commandInput = useRef<HTMLInputElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
   useEffect(() => { if (commandLine !== null) commandInput.current?.focus(); }, [commandLine]);
+  useEffect(() => { if (searchLine !== null) searchInput.current?.focus(); }, [searchLine]);
   const vim = useRef<VimAdapter | null>(null);
   const documentChannel = useRef<BroadcastChannel | null>(null);
   const suppressUpdate = useRef(false);
@@ -147,7 +152,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     vim.current = new VimAdapter(editor, (key) => {
       if (["s", "v"].includes(key)) void persistCurrent(true).then(() => openDocumentWindow(documentId, documentName, true)).catch(() => {});
       else if (["w", "W", "p", "h", "j", "k", "l"].includes(key)) void focusAdjacentWindow(key === "W" || key === "p" || key === "h" || key === "k" ? -1 : 1);
-    }, () => { setCommandLine(""); requestAnimationFrame(() => commandInput.current?.focus()); });
+    }, () => { setCommandLine(""); requestAnimationFrame(() => commandInput.current?.focus()); },
+    (backward) => { setSearchLine({ backward, query: "" }); requestAnimationFrame(() => searchInput.current?.focus()); });
     vim.current.setEnabled(vimEnabled);
     setVimMode(vim.current.mode());
     return () => { vim.current = null; };
@@ -231,8 +237,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     };
   }, [editor]);
 
-  const saveDocument = async () => {
-    if (!editor || busy || !ready) return;
+  const saveDocument = async (): Promise<boolean> => {
+    if (!editor || busy || !ready) return false;
     setBusy(true);
     try {
       const baseName = documentName.replace(/\.docx$/i, "");
@@ -240,7 +246,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       if (isTauri()) {
         if (!currentSavePath.current) {
           const selected = await save({ defaultPath: suggestedName, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
-          if (!selected) return;
+          if (!selected) return false;
           currentSavePath.current = selected;
         }
         await persistCurrent();
@@ -255,9 +261,64 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         await persistCurrent();
       }
       if (!isTauri()) setSaveStatus(`DOCX сохранён ${new Date().toLocaleTimeString("ru-RU")}`);
-    } catch { setSaveStatus(""); }
+      return true;
+    } catch { setSaveStatus(""); return false; }
     finally { setBusy(false); }
   };
+
+  const quitDocument = async (): Promise<void> => {
+    try { await persistCurrent(true); } catch { return; }
+    await showLibrary();
+    if (isTauri() && getCurrentWindow().label !== "main") await getCurrentWindow().destroy();
+  };
+
+  const writeQuitAll = async (): Promise<void> => {
+    if (!isTauri()) { if (await saveDocument()) await quitDocument(); return; }
+    const windows = (await WebviewWindow.getAll()).filter((item) => item.label.startsWith("doc-"));
+    if (!windows.length) { if (await saveDocument()) await quitDocument(); return; }
+    const owners = [...new Map(windows.slice().sort((a, b) => a.label.length - b.label.length || a.label.localeCompare(b.label))
+      .map((item) => [item.label.slice(4).split("--")[0], item])).values()];
+    for (const owner of owners) {
+      if (owner.label === getCurrentWindow().label) {
+        if (!(await saveDocument())) return;
+        continue;
+      }
+      if (/Android/i.test(navigator.userAgent)) await invoke("focus_task", { id: owner.label.slice(4) });
+      else await owner.setFocus();
+      const token = crypto.randomUUID();
+      const result = await new Promise<boolean>((resolve) => {
+        let done = false;
+        let unlisten: (() => void) | null = null;
+        const timer = window.setTimeout(() => { if (!done) { done = true; unlisten?.(); resolve(false); } }, 120_000);
+        void listen<{ token: string; ok: boolean }>("vim-write-result", (event) => {
+          if (event.payload.token !== token || done) return;
+          done = true; window.clearTimeout(timer); unlisten?.(); resolve(event.payload.ok);
+        }).then((stop) => {
+          unlisten = stop;
+          void emitTo(owner.label, "vim-write-request", { token, replyTo: getCurrentWindow().label }).catch(() => {
+            if (!done) { done = true; window.clearTimeout(timer); stop(); resolve(false); }
+          });
+        }).catch(() => { if (!done) { done = true; window.clearTimeout(timer); resolve(false); } });
+      });
+      if (!result) return;
+    }
+    for (const other of windows) if (other.label !== getCurrentWindow().label) await emitTo(other.label, "vim-quit-request");
+    await quitDocument();
+  };
+
+  const saveHandler = useRef(saveDocument);
+  const quitHandler = useRef(quitDocument);
+  saveHandler.current = saveDocument;
+  quitHandler.current = quitDocument;
+  useEffect(() => {
+    if (!isTauri()) return;
+    const writeListener = getCurrentWindow().listen<{ token: string; replyTo: string }>("vim-write-request", async (event) => {
+      const ok = await saveHandler.current();
+      await emitTo(event.payload.replyTo, "vim-write-result", { token: event.payload.token, ok });
+    });
+    const quitListener = getCurrentWindow().listen("vim-quit-request", () => { void quitHandler.current(); });
+    return () => { void writeListener.then((stop) => stop()); void quitListener.then((stop) => stop()); };
+  }, []);
   const active = useEditorState({
     editor,
     selector: ({ editor: current }) =>
@@ -392,10 +453,24 @@ function DocumentEditor({ documentId }: { documentId: string }) {
                 if (/^(?:sp(?:lit)?|vs(?:plit)?)$/.test(command)) void persistCurrent(true).then(() => openDocumentWindow(documentId, documentName, true)).then(() => {
                   if (!isTauri()) editor?.commands.focus();
                 }).catch(() => {});
-                else {
-                  if (/^(?:w|write)$/.test(command)) void saveDocument();
-                  editor?.commands.focus();
-                }
+                else if (/^(?:w|write)$/.test(command)) void saveDocument().then(() => editor?.commands.focus());
+                else if (/^(?:q|quit)$/.test(command)) void quitDocument();
+                else if (/^(?:wq|x)$/.test(command)) void saveDocument().then((saved) => { if (saved) void quitDocument(); else editor?.commands.focus(); });
+                else if (/^(?:wqa|wqall|xa|xall)$/.test(command)) void writeQuitAll();
+                else editor?.commands.focus();
+              }
+            }} />
+        </label>}
+        {searchLine !== null && <label className="vim-command">{searchLine.backward ? "?" : "/"}
+          <input ref={searchInput} aria-label="Поиск Vim" value={searchLine.query}
+            onChange={(event) => setSearchLine({ ...searchLine, query: event.target.value })}
+            onKeyDown={(event) => {
+              event.stopPropagation();
+              if (event.key === "Escape") { setSearchLine(null); editor?.commands.focus(); }
+              if (event.key === "Enter") {
+                vim.current?.submitSearch(searchLine.query, searchLine.backward);
+                setSearchLine(null);
+                editor?.commands.focus();
               }
             }} />
         </label>}
