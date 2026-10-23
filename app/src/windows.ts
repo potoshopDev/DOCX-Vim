@@ -20,6 +20,7 @@ export async function openDocumentWindow(id: string, name: string, duplicate = f
   if (existing) {
     if (android) await invoke("focus_task", { id: existing.label.slice(4) });
     else { await existing.show(); await existing.setFocus(); }
+    await existing.emit("focus-editor");
     return;
   }
   try {
@@ -50,6 +51,7 @@ export async function focusAdjacentWindow(direction: number): Promise<void> {
   const target = windows[(index + direction + windows.length) % windows.length];
   if (/Android/i.test(navigator.userAgent)) await invoke("focus_task", { id: target.label.slice(4) });
   else { await target.show(); await target.setFocus(); }
+  await target.emit("focus-editor");
 }
 
 export async function isDocumentSaveOwner(id: string): Promise<boolean> {

@@ -26,7 +26,8 @@
     "jszip": "^3.10.2",
     "mammoth": "^1.13.0",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "vim-prosemirror": "^0.2.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

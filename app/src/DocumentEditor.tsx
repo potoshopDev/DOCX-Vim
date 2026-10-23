@@ -9,7 +9,9 @@ import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
 import { readDraft, type Draft } from "./draft";
 import { editorExtensions } from "./editor-extensions";
 import { readSettings } from "./settings";
-import { VimController, type VimMode } from "./vim";
+import { VimMode as VimExtension, getVimMode } from "vim-prosemirror/tiptap";
+import "vim-prosemirror/style.css";
+import { VimAdapter, type VimMode } from "./vim-adapter";
 import { focusAdjacentWindow, isDocumentSaveOwner, openDocumentWindow, openWindowIds, registerDocumentTask, showLibrary } from "./windows";
 import "./App.css";
 
@@ -24,9 +26,12 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [busy, setBusy] = useState(false);
   const [vimEnabled, setVimEnabled] = useState(true);
   const [hideMenu, setHideMenu] = useState(false);
-  const [vimMode, setVimMode] = useState<VimMode>("NORMAL");
+  const [vimMode, setVimMode] = useState<VimMode>("normal");
   const [showHeadings, setShowHeadings] = useState(false);
-  const vim = useRef<VimController | null>(null);
+  const [commandLine, setCommandLine] = useState<string | null>(null);
+  const commandInput = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (commandLine !== null) commandInput.current?.focus(); }, [commandLine]);
+  const vim = useRef<VimAdapter | null>(null);
   const documentChannel = useRef<BroadcastChannel | null>(null);
   const suppressUpdate = useRef(false);
   const editorArea = useRef<HTMLElement>(null);
@@ -49,7 +54,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     scrollTop: editorArea.current?.scrollTop,
   });
   const editor = useEditor({
-    extensions: editorExtensions,
+    extensions: [...editorExtensions, VimExtension],
     content: "<p></p>",
     editorProps: {
       handleKeyDown: (_view, event) => vim.current?.handle(event) ?? false,
@@ -65,6 +70,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
       }
     },
+    onTransaction: ({ editor: current }) => setVimMode(getVimMode(current)),
   });
   useEffect(() => {
     if (!editor) return;
@@ -93,6 +99,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       }
       currentReady.current = true;
       setReady(true);
+      requestAnimationFrame(() => editor.commands.focus());
       setSaveStatus("Готово");
       void registerDocumentTask(isTauri() ? getCurrentWindow().label.slice(4) : documentId, draft.name);
       if (draft.scrollTop != null) requestAnimationFrame(() => {
@@ -137,21 +144,29 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   }, [editor, ready, documentId]);
   useEffect(() => {
     if (!editor) return;
-    vim.current = vimEnabled ? new VimController(editor, setVimMode, (key) => {
-      if (["s", "v"].includes(key)) void openDocumentWindow(documentId, documentName, true);
+    vim.current = new VimAdapter(editor, (key) => {
+      if (["s", "v"].includes(key)) void persistCurrent(true).then(() => openDocumentWindow(documentId, documentName, true)).catch(() => {});
       else if (["w", "W", "p", "h", "j", "k", "l"].includes(key)) void focusAdjacentWindow(key === "W" || key === "p" || key === "h" || key === "k" ? -1 : 1);
-    }, () => { const query = window.prompt("Поиск в документе"); if (query) vim.current?.find(query); }) : null;
-    setVimMode(vimEnabled ? "NORMAL" : "INSERT");
+    }, () => { setCommandLine(""); requestAnimationFrame(() => commandInput.current?.focus()); });
+    vim.current.setEnabled(vimEnabled);
+    setVimMode(vim.current.mode());
     return () => { vim.current = null; };
   }, [editor, vimEnabled, documentId, documentName]);
   useEffect(() => { editor?.setEditable(ready); }, [editor, ready]);
   useEffect(() => {
     const refreshSettings = () => { void readSettings().then((settings) => {
       setVimEnabled(settings.vimEnabled); setHideMenu(settings.hideMenu);
-    }); };
+    }); if (currentReady.current) requestAnimationFrame(() => editor?.commands.focus()); };
     addEventListener("focus", refreshSettings);
     return () => removeEventListener("focus", refreshSettings);
-  }, []);
+  }, [editor]);
+  useEffect(() => {
+    if (!isTauri() || !editor) return;
+    const listener = getCurrentWindow().listen("focus-editor", () => {
+      if (currentReady.current) requestAnimationFrame(() => editor.commands.focus());
+    });
+    return () => { void listener.then((unlisten) => unlisten()); };
+  }, [editor]);
   useEffect(() => {
     if (!editor || !ready) return;
     setSaveStatus("Сохранение в фоне…");
@@ -365,6 +380,25 @@ function DocumentEditor({ documentId }: { documentId: string }) {
 
       <footer className="status-bar">
         <span>{vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
+        {commandLine !== null && <label className="vim-command">:
+          <input ref={commandInput} aria-label="Команда Vim" value={commandLine}
+            onChange={(event) => setCommandLine(event.target.value)}
+            onKeyDown={(event) => {
+              event.stopPropagation();
+              if (event.key === "Escape") { setCommandLine(null); editor?.commands.focus(); }
+              if (event.key === "Enter") {
+                const command = commandLine.trim().replace(/^:/, "");
+                setCommandLine(null);
+                if (/^(?:sp(?:lit)?|vs(?:plit)?)$/.test(command)) void persistCurrent(true).then(() => openDocumentWindow(documentId, documentName, true)).then(() => {
+                  if (!isTauri()) editor?.commands.focus();
+                }).catch(() => {});
+                else {
+                  if (/^(?:w|write)$/.test(command)) void saveDocument();
+                  editor?.commands.focus();
+                }
+              }
+            }} />
+        </label>}
         {hideMenu && <button type="button" onClick={() => setShowHeadings((value) => !value)}>Заголовки</button>}
         <span>{saveStatus}</span>
       </footer>

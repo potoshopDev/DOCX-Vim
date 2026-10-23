@@ -52,6 +52,8 @@ button, select { font: inherit; }
 .tiptap a { color: #195ea8; text-decoration: underline; }
 .status-bar { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 1rem; background: #22334b; color: white; font-size: 0.75rem; }
 .status-bar button { border: 0; background: transparent; color: white; text-decoration: underline; cursor: pointer; }
+.vim-command { display: flex; align-items: center; flex: 1; gap: 0.3rem; }
+.vim-command input { flex: 1; min-width: 3rem; border: 0; background: transparent; color: white; outline: none; font: inherit; }
 .start-screen { height: 100dvh; overflow: auto; background: #f2f5f9; }
 .start-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem max(1.25rem, calc((100vw - 900px) / 2)); background: #fff; border-bottom: 1px solid #cbd3df; }
 .start-header h1 { margin: 0; font-size: 1.4rem; }
