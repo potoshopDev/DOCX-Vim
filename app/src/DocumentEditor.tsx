@@ -88,7 +88,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
       }, settings.autosaveMs);
       suppressUpdate.current = true;
-      editor.commands.setContent(draft.document);
+      editor.chain().setMeta("addToHistory", false).setContent(draft.document, { emitUpdate: false }).run();
       suppressUpdate.current = false;
       currentName.current = draft.name;
       currentSourcePath.current = draft.sourcePath;
@@ -132,7 +132,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       const anchor = editor.state.selection.anchor;
       const head = editor.state.selection.head;
       suppressUpdate.current = true;
-      editor.commands.setContent(event.data.document);
+      editor.chain().setMeta("addToHistory", false).setContent(event.data.document, { emitUpdate: false }).run();
       const max = editor.state.doc.content.size;
       editor.commands.setTextSelection({ from: Math.min(anchor, max), to: Math.min(head, max) });
       suppressUpdate.current = false;

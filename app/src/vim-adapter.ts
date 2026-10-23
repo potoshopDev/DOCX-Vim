@@ -1,6 +1,6 @@
 import type { Editor, JSONContent } from "@tiptap/core";
 import { vimPluginKey } from "vim-prosemirror";
-import { TextSelection } from "@tiptap/pm/state";
+import { Selection, TextSelection } from "@tiptap/pm/state";
 
 const russian = "йцукенгшщзхъфывапролджэячсмитьбю";
 const english = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
@@ -125,11 +125,15 @@ export class VimAdapter {
     const lineHeight = Number.parseFloat(getComputedStyle(view.dom).lineHeight) || rect.bottom - rect.top || 24;
     const x = this.preferredX ?? rect.left;
     this.preferredX = x;
-    for (let step = 1; step <= 5; step++) {
-      const target = view.posAtCoords({ left: x, top: (direction > 0 ? rect.bottom : rect.top) + direction * lineHeight * (step - 0.5) });
+    for (let step = 0; step < 24; step++) {
+      const target = view.posAtCoords({ left: x, top: (direction > 0 ? rect.bottom + 1 : rect.top - 1) + direction * lineHeight * step / 4 });
       if (!target) continue;
-      const targetTop = view.coordsAtPos(target.pos).top;
-      if (direction * (targetTop - rect.top) > 2) return target.pos;
+      const $target = view.state.doc.resolve(target.pos);
+      const cursor = $target.parent.isTextblock ? target.pos
+        : (Selection.findFrom($target, direction, true) ?? Selection.findFrom($target, -direction, true))?.$from.pos;
+      if (cursor === undefined) continue;
+      const targetTop = view.coordsAtPos(cursor).top;
+      if (direction * (targetTop - rect.top) > 2) return cursor;
     }
     return pos;
   }
