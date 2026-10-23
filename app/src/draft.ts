@@ -10,6 +10,9 @@ export type Draft = {
   updatedAt: string;
   sourcePath?: string;
   savePath?: string;
+  viewMode?: "page" | "mobile";
+  selection?: { anchor: number; head: number };
+  scrollTop?: number;
 };
 const directory = "drafts";
 const key = (id: string) => `docx-vim-draft-${id}`;

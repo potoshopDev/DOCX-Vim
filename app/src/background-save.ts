@@ -26,7 +26,8 @@ function exportInWorker(document: JSONContent): Promise<Uint8Array> {
 
 export class BackgroundSaver {
   private entries = new Map<string, Entry>();
-  constructor(private readonly onSaved: (id: string, path: string | undefined) => void) {}
+  constructor(private readonly onSaved: (id: string, path: string | undefined) => void,
+    private readonly delayMs = 800) {}
 
   private entry(id: string): Entry {
     let entry = this.entries.get(id);
@@ -41,7 +42,7 @@ export class BackgroundSaver {
     const entry = this.entry(draft.id);
     entry.latest = { draft, token: ++entry.nextToken };
     if (entry.timer) window.clearTimeout(entry.timer);
-    entry.timer = window.setTimeout(() => { entry.timer = undefined; void this.run(draft.id); }, 800);
+    entry.timer = window.setTimeout(() => { entry.timer = undefined; void this.run(draft.id); }, this.delayMs);
   }
 
   flush(draft: Draft): Promise<void> {

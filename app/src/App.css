@@ -9,7 +9,7 @@ html, body, #root { height: 100%; }
 body { margin: 0; min-width: 320px; overflow: hidden; }
 button, select { font: inherit; }
 .app-shell { height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
-.app-header, .toolbar, .status-bar, .recovery-banner { flex-shrink: 0; }
+.app-header, .toolbar, .status-bar { flex-shrink: 0; }
 .app-header {
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
   padding: 0.8rem 1.25rem; background: #fff; border-bottom: 1px solid #cbd3df;
@@ -17,10 +17,8 @@ button, select { font: inherit; }
 .app-header h1 { font-size: 1.2rem; margin: 0; }
 .app-header p { font-size: 0.78rem; color: #667182; margin: 0.2rem 0 0; }
 .file-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
-.file-actions button, .recovery-banner button { border: 1px solid #aeb9c8; border-radius: 0.4rem; background: #fff; padding: 0.45rem 0.65rem; cursor: pointer; }
+.file-actions button { border: 1px solid #aeb9c8; border-radius: 0.4rem; background: #fff; padding: 0.45rem 0.65rem; cursor: pointer; }
 .file-actions button:disabled { opacity: 0.5; cursor: default; }
-.recovery-banner { padding: 0.7rem 1rem; background: #fff5db; border-bottom: 1px solid #e3c677; font-size: 0.9rem; }
-.recovery-banner { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
 .view-switch { display: flex; border: 1px solid #aeb9c8; border-radius: 0.5rem; overflow: hidden; }
 .view-switch button, .toolbar button { border: 0; background: #fff; padding: 0.5rem 0.8rem; cursor: pointer; }
 .view-switch button + button { border-left: 1px solid #aeb9c8; }
@@ -50,6 +48,27 @@ button, select { font: inherit; }
 .tiptap ul, .tiptap ol { padding-left: 1.7rem; }
 .tiptap a { color: #195ea8; text-decoration: underline; }
 .status-bar { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 1rem; background: #22334b; color: white; font-size: 0.75rem; }
+.start-screen { height: 100dvh; overflow: auto; background: #f2f5f9; }
+.start-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem max(1.25rem, calc((100vw - 900px) / 2)); background: #fff; border-bottom: 1px solid #cbd3df; }
+.start-header h1 { margin: 0; font-size: 1.4rem; }
+.start-header p { margin: 0.2rem 0 0; color: #667182; }
+.start-header button, .start-actions button { border: 1px solid #aeb9c8; border-radius: 0.5rem; background: white; padding: 0.7rem 1rem; cursor: pointer; }
+.start-content { width: min(100% - 2rem, 900px); margin: 1.5rem auto; display: grid; gap: 1.2rem; }
+.start-actions { display: flex; gap: 0.7rem; flex-wrap: wrap; }
+.start-actions button:first-child { background: #245ca0; border-color: #245ca0; color: white; }
+.start-actions button:disabled, .document-list button:disabled { opacity: 0.5; }
+.start-panel { background: #fff; border: 1px solid #d6dde7; border-radius: 0.8rem; padding: 1rem; }
+.start-panel h2 { margin: 0 0 0.8rem; font-size: 1.05rem; }
+.empty-list { color: #697587; margin: 0; }
+.document-list { list-style: none; padding: 0; margin: 0; }
+.document-list li + li { border-top: 1px solid #e1e6ed; }
+.document-list button { width: 100%; text-align: left; border: 0; background: transparent; padding: 0.8rem 0.25rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.2rem; }
+.document-list button:hover { background: #f1f6fd; }
+.document-list span { font-size: 0.8rem; color: #687587; }
+.settings-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.8rem; }
+.settings-panel h2 { grid-column: 1 / -1; }
+.settings-panel label { display: grid; gap: 0.3rem; font-size: 0.87rem; }
+.settings-panel select { border: 1px solid #aeb9c8; border-radius: 0.4rem; padding: 0.6rem; background: white; }
 @media (max-width: 680px) {
   .app-header { align-items: stretch; flex-direction: column; padding: calc(0.65rem + max(env(safe-area-inset-top), 24px)) 0.65rem 0.65rem; }
   .app-header p { display: none; }
@@ -64,4 +83,7 @@ button, select { font: inherit; }
   .editor-area--mobile .tiptap { padding: 1rem 1.1rem; font-size: 19px; line-height: 1.6; }
   .status-bar { flex-wrap: wrap; }
   .status-bar { padding-bottom: calc(0.45rem + max(env(safe-area-inset-bottom), 24px)); }
+  .start-header { padding: calc(0.75rem + max(env(safe-area-inset-top), 24px)) 1rem 0.75rem; }
+  .start-content { width: calc(100% - 1.2rem); margin: 0.7rem auto; gap: 0.7rem; }
+  .settings-panel { grid-template-columns: 1fr; }
 }
