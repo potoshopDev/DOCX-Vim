@@ -1,0 +1,50 @@
+# User-provided DOCX examples remain local.
+/e/
+
+# JavaScript and frontend output.
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/coverage/
+**/.vite/
+*.local
+.env
+.env.*
+!.env.example
+
+# Rust/Tauri build output and generated schemas.
+**/target/
+/app/src-tauri/gen/schemas/
+
+# Android generated build output; keep editable Android project sources.
+/app/src-tauri/gen/android/.gradle/
+/app/src-tauri/gen/android/.kotlin/
+/app/src-tauri/gen/android/.tauri/
+/app/src-tauri/gen/android/**/build/
+/app/src-tauri/gen/android/app/src/main/assets/
+/app/src-tauri/gen/android/app/src/main/jniLibs/
+/app/src-tauri/gen/android/app/tauri.build.gradle.kts
+/app/src-tauri/gen/android/app/tauri.properties
+/app/src-tauri/gen/android/tauri.settings.gradle
+/app/src-tauri/gen/android/local.properties
+/app/src-tauri/gen/android/**/local.properties
+/app/src-tauri/gen/android/**/key.properties
+/app/src-tauri/gen/android/**/keystore.properties
+
+# Signing keys, secrets and local tooling.
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+.idea/
+.vscode/
+*.iml
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.DS_Store
+Thumbs.db
