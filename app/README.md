@@ -20,9 +20,14 @@ npm run tauri android dev
 ```powershell
 npm run build
 npm run tauri -- build --no-bundle
+# Эмулятор x86_64:
 npm run tauri -- android build --debug --target x86_64 --apk --ci
+# Телефон с ABI arm64-v8a:
+npm run tauri -- android build --debug --target aarch64 --apk --ci
 ```
 
-Для реального Android-устройства позже потребуется сборка `aarch64`, тест с Bluetooth-клавиатурой и выпускной ключ подписи.
+Обе команды записывают APK в `src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`, поэтому после новой сборки предыдущий файл заменяется. Для реального Android-устройства ещё нужны испытания с Bluetooth-клавиатурой; для выпуска понадобится отдельная подпись.
+
+Проверенный APK для телефона (`arm64-v8a`) дополнительно скопирован в `../builds/DOCX-Vim-0.1.0-arm64-v8a-debug.apk`. Папка `builds/` локальная и исключена из Git; этот файл подписан отладочным ключом и предназначен для ручной проверки установки.
 
 Исходный код распространяется по [лицензии MIT](../LICENSE). Пользовательские примеры DOCX из `../e/` в репозиторий не включаются.

@@ -1,5 +1,6 @@
 # User-provided DOCX examples remain local.
 /e/
+/builds/
 
 # Local agent instructions must not be published.
 /agents.md
