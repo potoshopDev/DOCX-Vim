@@ -155,14 +155,14 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           ? event.code === "KeyN" || ["n", "N", "т", "Т"].includes(event.key) ? 1
             : event.code === "KeyP" || ["p", "P", "з", "З"].includes(event.key) ? -1 : 0
           : 0;
-        if (editable && correctionKey) {
+        if (correctionKey) {
           event.preventDefault();
           event.stopPropagation();
           showCorrectionsAtCaret(correctionKey as 1 | -1);
           return true;
         }
         const correction = selectedIssueRef.current;
-        if (editable && event.key === "Tab" && correction?.suggestions.length) {
+        if (event.key === "Tab" && correction?.suggestions.length) {
           event.preventDefault();
           const replacement = correction.suggestions[correctionIndexRef.current];
           editor?.chain().focus().insertContentAt({ from: correction.from, to: correction.to }, replacement).run();
@@ -170,14 +170,14 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           setSelectedIssue(null);
           return true;
         }
-        if (editable && event.key === "Tab" && !completionRef.current) {
+        if (event.key === "Tab" && (!editable || !completionRef.current)) {
           event.preventDefault();
           event.stopPropagation();
           showCorrectionsAtCaret(1);
           if (assistSettingsRef.current.autocomplete) setSelectionRevision((value) => value + 1);
           return true;
         }
-        if (editable && event.key === "Escape" && correction) {
+        if (event.key === "Escape" && correction) {
           event.preventDefault();
           correctionRequest.current++;
           selectedIssueRef.current = null;
