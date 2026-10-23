@@ -8,7 +8,8 @@ const labelFor = (id: string) => `doc-${id}`;
 export const routeDocumentId = () => new URLSearchParams(location.search).get("doc");
 
 export async function openDocumentWindow(id: string, name: string, duplicate = false): Promise<void> {
-  if (!isTauri() || !(await supportsMultipleWindows())) {
+  const android = isTauri() && /Android/i.test(navigator.userAgent);
+  if (!isTauri() || (!android && !(await supportsMultipleWindows()))) {
     history.pushState(null, "", `?doc=${encodeURIComponent(id)}`);
     dispatchEvent(new PopStateEvent("popstate"));
     return;
@@ -16,23 +17,28 @@ export async function openDocumentWindow(id: string, name: string, duplicate = f
   const label = duplicate ? `${labelFor(id)}--${crypto.randomUUID().slice(0, 8)}` : labelFor(id);
   const existing = duplicate ? null : (await WebviewWindow.getByLabel(label))
     ?? (await WebviewWindow.getAll()).find((item) => item.label.startsWith(`${label}--`)) ?? null;
-  const android = /Android/i.test(navigator.userAgent);
   if (existing) {
     if (android) await invoke("focus_task", { id: existing.label.slice(4) });
     else { await existing.show(); await existing.setFocus(); }
     return;
   }
-  const window = new WebviewWindow(label, {
-    url: `index.html?doc=${encodeURIComponent(id)}`,
-    title: name,
-    width: 940,
-    height: 720,
-    ...(android ? { activityName: "DocumentActivity" } : {}),
-  });
-  await new Promise<void>((resolve, reject) => {
-    void window.once("tauri://created", () => resolve());
-    void window.once("tauri://error", (event) => reject(new Error(String(event.payload))));
-  });
+  try {
+    const window = new WebviewWindow(label, {
+      url: `index.html?doc=${encodeURIComponent(id)}`,
+      title: name,
+      width: 940,
+      height: 720,
+      ...(android ? { activityName: "DocumentActivity" } : {}),
+    });
+    await new Promise<void>((resolve, reject) => {
+      void window.once("tauri://created", () => resolve());
+      void window.once("tauri://error", (event) => reject(new Error(String(event.payload))));
+    });
+  } catch (error) {
+    if (!android) throw error;
+    history.pushState(null, "", `?doc=${encodeURIComponent(id)}`);
+    dispatchEvent(new PopStateEvent("popstate"));
+  }
 }
 
 export async function focusAdjacentWindow(direction: number): Promise<void> {
@@ -54,12 +60,13 @@ export async function isDocumentSaveOwner(id: string): Promise<boolean> {
 }
 
 export async function showLibrary(): Promise<void> {
-  if (!isTauri() || !(await supportsMultipleWindows())) {
+  const android = isTauri() && /Android/i.test(navigator.userAgent);
+  if (!isTauri() || (!android && !(await supportsMultipleWindows())) || (android && getCurrentWindow().label === "main")) {
     history.pushState(null, "", location.pathname);
     dispatchEvent(new PopStateEvent("popstate"));
     return;
   }
-  if (/Android/i.test(navigator.userAgent)) { await invoke("focus_task", { id: "main" }); return; }
+  if (android) { await invoke("focus_task", { id: "main" }); return; }
   const main = await WebviewWindow.getByLabel("main");
   if (main) { await main.show(); await main.setFocus(); }
 }
