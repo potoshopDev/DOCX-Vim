@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
 import type { EditorState } from "@tiptap/pm/state";
+import type { EditorProps } from "@tiptap/pm/view";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -53,6 +55,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [assistSettings, setAssistSettings] = useState<Settings>(defaultSettings);
   const [personal, setPersonal] = useState<PersonalDictionary>({ ru: [], en: [] });
   const [selectedIssue, setSelectedIssue] = useState<TextIssue | null>(null);
+  const [correctionPending, setCorrectionPending] = useState(false);
   const [correctionIndex, setCorrectionIndex] = useState(0);
   const [completion, setCompletion] = useState<{ from: number; to: number; suggestion: string } | null>(null);
   const [selectionRevision, setSelectionRevision] = useState(0);
@@ -105,18 +108,19 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const showCorrectionsAtCaret = (direction: 1 | -1) => {
     if (!editor) return;
     const target = wordAtCaret(editor.state);
-    if (!target) { selectedIssueRef.current = null; setSelectedIssue(null); return; }
+    if (!target) { selectedIssueRef.current = null; setSelectedIssue(null); setCorrectionPending(false); return; }
     const current = selectedIssueRef.current;
     if (current?.from === target.from && current.to === target.to && current.suggestions.length) {
       const next = (correctionIndexRef.current + direction + current.suggestions.length) % current.suggestions.length;
       correctionIndexRef.current = next;
-      setCorrectionIndex(next);
+      flushSync(() => setCorrectionIndex(next));
       return;
     }
     const issue = issuesRef.current.find((item) => item.from === target.from && item.to === target.to);
     if (issue?.kind === "grammar") {
       selectedIssueRef.current = issue;
       setSelectedIssue(issue);
+      setCorrectionPending(false);
       correctionIndexRef.current = 0;
       setCorrectionIndex(0);
       return;
@@ -124,23 +128,27 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const request = ++correctionRequest.current;
     const caret = editor.state.selection.from;
     const language: Language = /[А-Яа-яЁё]/.test(target.word) ? "ru" : "en";
+    const pending: TextIssue = issue ?? { ...target, kind: "spelling", suggestions: [] };
+    selectedIssueRef.current = pending;
+    flushSync(() => { setSelectedIssue(pending); setCorrectionPending(true); });
     void askWorker({ type: "suggest", word: target.word, language, personal: personalRef.current })
       .then((result: { suggestions?: string[]; correct?: boolean }) => {
         if (request !== correctionRequest.current || !editor || editor.state.selection.from !== caret ||
           editor.state.doc.textBetween(target.from, target.to) !== target.word) return;
-        if (result.correct) { selectedIssueRef.current = null; setSelectedIssue(null); return; }
-        const selected: TextIssue = issue ?? { ...target, kind: "spelling", suggestions: [] };
-        const next = { ...selected, suggestions: result.suggestions ?? [] };
+        if (result.correct) {
+          selectedIssueRef.current = null;
+          flushSync(() => { setSelectedIssue(null); setCorrectionPending(false); });
+          return;
+        }
+        const next = { ...pending, suggestions: result.suggestions ?? [] };
         selectedIssueRef.current = next;
-        setSelectedIssue(next);
         correctionIndexRef.current = 0;
-        setCorrectionIndex(0);
+        flushSync(() => { setSelectedIssue(next); setCorrectionIndex(0); setCorrectionPending(false); });
       });
   };
-  const editor = useEditor({
-    extensions: [...editorExtensions, VimExtension, TextCheck],
-    content: "<p></p>",
-    editorProps: {
+  const stableExtensions = useMemo(() => [...editorExtensions, VimExtension, TextCheck], []);
+  const editorHandlers = useRef<EditorProps>({});
+  editorHandlers.current = {
       handleKeyDown: (_view, event) => {
         const editable = !vim.current?.enabled || vim.current?.mode() === "insert";
         const correctionKey = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
@@ -162,10 +170,19 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           setSelectedIssue(null);
           return true;
         }
+        if (editable && event.key === "Tab" && !completionRef.current) {
+          event.preventDefault();
+          event.stopPropagation();
+          showCorrectionsAtCaret(1);
+          if (assistSettingsRef.current.autocomplete) setSelectionRevision((value) => value + 1);
+          return true;
+        }
         if (editable && event.key === "Escape" && correction) {
           event.preventDefault();
+          correctionRequest.current++;
           selectedIssueRef.current = null;
           setSelectedIssue(null);
+          setCorrectionPending(false);
           return true;
         }
         if (editable && completionRef.current && (event.key === "Tab" || (event.ctrlKey && event.code === "Space"))) {
@@ -199,6 +216,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         const issue = issuesRef.current.find((item) => item.from <= pos && pos <= item.to);
         selectedIssueRef.current = issue ?? null;
         setSelectedIssue(issue ?? null);
+        setCorrectionPending(false);
         correctionIndexRef.current = 0;
         setCorrectionIndex(0);
         if (issue?.kind === "spelling") {
@@ -214,16 +232,27 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         }
         return false;
       },
+    };
+  const stableEditorProps = useMemo<EditorProps>(() => ({
+      handleKeyDown: (view, event) => editorHandlers.current.handleKeyDown?.(view, event) ?? false,
+      handleTextInput: (view, from, to, text, deflt) => editorHandlers.current.handleTextInput?.(view, from, to, text, deflt) ?? false,
+      handleClick: (view, pos, event) => editorHandlers.current.handleClick?.(view, pos, event) ?? false,
       attributes: {
         lang: "ru",
         "aria-label": "Текст документа",
         spellcheck: "false",
       },
-    },
+    }), []);
+  const editor = useEditor({
+    extensions: stableExtensions,
+    content: "<p></p>",
+    editorProps: stableEditorProps,
     onUpdate: () => {
       if (!suppressUpdate.current) {
+        correctionRequest.current++;
         selectedIssueRef.current = null;
         setSelectedIssue(null);
+        setCorrectionPending(false);
         setRevision((value) => value + 1);
         documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
       }
@@ -700,6 +729,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
 
       {selectedIssue && <div className="correction-panel" role="group" aria-label="Исправление текста">
         <span>{selectedIssue.message || `Слово «${selectedIssue.word}» не найдено в словаре`}</span>
+        {correctionPending && <span>Подбираем варианты…</span>}
+        {!correctionPending && !selectedIssue.suggestions.length && <span>Вариантов нет</span>}
         {selectedIssue.suggestions.map((word, index) => <button type="button" key={`${word}-${index}`}
           className={index === correctionIndex ? "correction-choice--active" : ""} aria-pressed={index === correctionIndex}
           onClick={() => replaceIssue(word)}>{word}</button>)}
