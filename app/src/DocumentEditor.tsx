@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
+import type { EditorState } from "@tiptap/pm/state";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -23,6 +24,23 @@ import "./App.css";
 
 type ViewMode = "page" | "mobile";
 
+function wordAtCaret(state: EditorState): { from: number; to: number; word: string } | null {
+  if (!state.selection.empty) return null;
+  const $from = state.selection.$from;
+  if (!$from.parent.isTextblock) return null;
+  const before = $from.nodeBefore?.text ?? "";
+  const after = $from.nodeAfter?.text ?? "";
+  const text = before + after;
+  for (const match of text.matchAll(/[A-Za-zА-Яа-яЁё]+(?:[’'-][A-Za-zА-Яа-яЁё]+)*/gu)) {
+    const start = match.index, end = start + match[0].length;
+    if (start <= before.length && before.length <= end) {
+      const from = $from.pos - (before.length - start);
+      return { from, to: from + match[0].length, word: match[0] };
+    }
+  }
+  return null;
+}
+
 function DocumentEditor({ documentId }: { documentId: string }) {
   const [viewMode, setViewMode] = useState<ViewMode>("mobile");
   const [documentName, setDocumentName] = useState("Новый документ");
@@ -34,11 +52,14 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [hideMenu, setHideMenu] = useState(false);
   const [assistSettings, setAssistSettings] = useState<Settings>(defaultSettings);
   const [personal, setPersonal] = useState<PersonalDictionary>({ ru: [], en: [] });
-  const [issues, setIssues] = useState<TextIssue[]>([]);
   const [selectedIssue, setSelectedIssue] = useState<TextIssue | null>(null);
+  const [correctionIndex, setCorrectionIndex] = useState(0);
   const [completion, setCompletion] = useState<{ from: number; to: number; suggestion: string } | null>(null);
   const [selectionRevision, setSelectionRevision] = useState(0);
   const issuesRef = useRef<TextIssue[]>([]);
+  const selectedIssueRef = useRef<TextIssue | null>(null);
+  const correctionIndexRef = useRef(0);
+  const correctionRequest = useRef(0);
   const ignoredIssues = useRef(new Set<string>());
   const completionRef = useRef<typeof completion>(null);
   const assistSettingsRef = useRef(assistSettings);
@@ -49,6 +70,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   assistSettingsRef.current = assistSettings;
   personalRef.current = personal;
   completionRef.current = completion;
+  selectedIssueRef.current = selectedIssue;
+  correctionIndexRef.current = correctionIndex;
   const [vimMode, setVimMode] = useState<VimMode>("normal");
   const [showHeadings, setShowHeadings] = useState(false);
   const [commandLine, setCommandLine] = useState<string | null>(null);
@@ -79,12 +102,72 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     selection: editor ? { anchor: editor.state.selection.anchor, head: editor.state.selection.head } : undefined,
     scrollTop: editorArea.current?.scrollTop,
   });
+  const showCorrectionsAtCaret = (direction: 1 | -1) => {
+    if (!editor) return;
+    const target = wordAtCaret(editor.state);
+    if (!target) { selectedIssueRef.current = null; setSelectedIssue(null); return; }
+    const current = selectedIssueRef.current;
+    if (current?.from === target.from && current.to === target.to && current.suggestions.length) {
+      const next = (correctionIndexRef.current + direction + current.suggestions.length) % current.suggestions.length;
+      correctionIndexRef.current = next;
+      setCorrectionIndex(next);
+      return;
+    }
+    const issue = issuesRef.current.find((item) => item.from === target.from && item.to === target.to);
+    if (issue?.kind === "grammar") {
+      selectedIssueRef.current = issue;
+      setSelectedIssue(issue);
+      correctionIndexRef.current = 0;
+      setCorrectionIndex(0);
+      return;
+    }
+    const request = ++correctionRequest.current;
+    const caret = editor.state.selection.from;
+    const language: Language = /[А-Яа-яЁё]/.test(target.word) ? "ru" : "en";
+    void askWorker({ type: "suggest", word: target.word, language, personal: personalRef.current })
+      .then((result: { suggestions?: string[]; correct?: boolean }) => {
+        if (request !== correctionRequest.current || !editor || editor.state.selection.from !== caret ||
+          editor.state.doc.textBetween(target.from, target.to) !== target.word) return;
+        if (result.correct) { selectedIssueRef.current = null; setSelectedIssue(null); return; }
+        const selected: TextIssue = issue ?? { ...target, kind: "spelling", suggestions: [] };
+        const next = { ...selected, suggestions: result.suggestions ?? [] };
+        selectedIssueRef.current = next;
+        setSelectedIssue(next);
+        correctionIndexRef.current = 0;
+        setCorrectionIndex(0);
+      });
+  };
   const editor = useEditor({
     extensions: [...editorExtensions, VimExtension, TextCheck],
     content: "<p></p>",
     editorProps: {
       handleKeyDown: (_view, event) => {
         const editable = !vim.current?.enabled || vim.current?.mode() === "insert";
+        const correctionKey = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
+          ? event.code === "KeyN" || ["n", "N", "т", "Т"].includes(event.key) ? 1
+            : event.code === "KeyP" || ["p", "P", "з", "З"].includes(event.key) ? -1 : 0
+          : 0;
+        if (editable && correctionKey) {
+          event.preventDefault();
+          event.stopPropagation();
+          showCorrectionsAtCaret(correctionKey as 1 | -1);
+          return true;
+        }
+        const correction = selectedIssueRef.current;
+        if (editable && event.key === "Tab" && correction?.suggestions.length) {
+          event.preventDefault();
+          const replacement = correction.suggestions[correctionIndexRef.current];
+          editor?.chain().focus().insertContentAt({ from: correction.from, to: correction.to }, replacement).run();
+          selectedIssueRef.current = null;
+          setSelectedIssue(null);
+          return true;
+        }
+        if (editable && event.key === "Escape" && correction) {
+          event.preventDefault();
+          selectedIssueRef.current = null;
+          setSelectedIssue(null);
+          return true;
+        }
         if (editable && completionRef.current && (event.key === "Tab" || (event.ctrlKey && event.code === "Space"))) {
           event.preventDefault();
           const item = completionRef.current;
@@ -114,14 +197,22 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       },
       handleClick: (_view, pos) => {
         const issue = issuesRef.current.find((item) => item.from <= pos && pos <= item.to);
+        selectedIssueRef.current = issue ?? null;
         setSelectedIssue(issue ?? null);
+        correctionIndexRef.current = 0;
+        setCorrectionIndex(0);
         if (issue?.kind === "spelling") {
           const language: Language = /[А-Яа-яЁё]/.test(issue.word) ? "ru" : "en";
-          void askWorker({ type: "suggest", word: issue.word, language }).then((result: { suggestions: string[] }) => {
-            setSelectedIssue((current) => current?.from === issue.from && current?.to === issue.to ? { ...current, suggestions: result.suggestions } : current);
+          void askWorker({ type: "suggest", word: issue.word, language, personal: personalRef.current }).then((result: { suggestions: string[] }) => {
+            setSelectedIssue((current) => {
+              if (current?.from !== issue.from || current?.to !== issue.to) return current;
+              const next = { ...current, suggestions: result.suggestions };
+              selectedIssueRef.current = next;
+              return next;
+            });
           });
         }
-          return false;
+        return false;
       },
       attributes: {
         lang: "ru",
@@ -131,6 +222,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     },
     onUpdate: () => {
       if (!suppressUpdate.current) {
+        selectedIssueRef.current = null;
+        setSelectedIssue(null);
         setRevision((value) => value + 1);
         documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
       }
@@ -283,7 +376,6 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         if (cancelled || snapshot !== editor.state.doc.textContent) return;
         let all = (result.issues ?? []).filter((issue) => !ignoredIssues.current.has(`${issue.kind}:${issue.word}`));
         issuesRef.current = all;
-        setIssues(all);
         editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, all).setMeta("addToHistory", false));
         if (assistSettings.grammarUrl.trim()) {
           try { all = [...all, ...(await checkGrammar(segments, assistSettings.language, assistSettings.grammarUrl, controller.signal))
@@ -292,7 +384,6 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         }
         if (cancelled || snapshot !== editor.state.doc.textContent) return;
         issuesRef.current = all;
-        setIssues(all);
         editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, all).setMeta("addToHistory", false));
       });
     }, 500);
@@ -524,14 +615,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     ignoredIssues.current.add(`${selectedIssue.kind}:${selectedIssue.word}`);
     const next = issuesRef.current.filter((issue) => !ignoredIssues.current.has(`${issue.kind}:${issue.word}`));
     issuesRef.current = next;
-    setIssues(next);
     editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, next).setMeta("addToHistory", false));
     setSelectedIssue(null);
     editor.commands.focus();
   };
-  useEffect(() => {
-    if (selectedIssue && !issues.some((issue) => issue.from === selectedIssue.from && issue.to === selectedIssue.to && issue.word === selectedIssue.word)) setSelectedIssue(null);
-  }, [issues, selectedIssue]);
 
   const formatButton = (label: string, title: string, selected: boolean, action: () => void) => (
     <button
@@ -613,7 +700,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
 
       {selectedIssue && <div className="correction-panel" role="group" aria-label="Исправление текста">
         <span>{selectedIssue.message || `Слово «${selectedIssue.word}» не найдено в словаре`}</span>
-        {selectedIssue.suggestions.map((word, index) => <button type="button" key={`${word}-${index}`} onClick={() => replaceIssue(word)}>{word}</button>)}
+        {selectedIssue.suggestions.map((word, index) => <button type="button" key={`${word}-${index}`}
+          className={index === correctionIndex ? "correction-choice--active" : ""} aria-pressed={index === correctionIndex}
+          onClick={() => replaceIssue(word)}>{word}</button>)}
         {selectedIssue.kind === "spelling" && <button type="button" onClick={addIssueWord}>Добавить в словарь</button>}
         <button type="button" onClick={ignoreIssue}>Игнорировать</button>
         <button type="button" onClick={() => setSelectedIssue(null)}>Закрыть</button>

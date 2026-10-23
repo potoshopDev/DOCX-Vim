@@ -3,7 +3,7 @@ import type { Language, PersonalDictionary } from "./personal-dictionary";
 
 type Segment = { from: number; text: string };
 type Issue = { from: number; to: number; word: string; suggestions: string[]; kind: "spelling" };
-type Request = { id: number; type: "check"; segments: Segment[]; personal: PersonalDictionary } | { id: number; type: "complete"; prefix: string; language: Language; personal: PersonalDictionary } | { id: number; type: "suggest"; word: string; language: Language };
+type Request = { id: number; type: "check"; segments: Segment[]; personal: PersonalDictionary } | { id: number; type: "complete"; prefix: string; language: Language; personal: PersonalDictionary } | { id: number; type: "suggest"; word: string; language: Language; personal: PersonalDictionary };
 const spelling = new Map<Language, ReturnType<typeof nspell>>();
 const roots = new Map<Language, string[]>();
 
@@ -41,7 +41,8 @@ self.onmessage = async (event: MessageEvent<Request>) => {
       self.postMessage({ id: request.id, type: "check", issues });
     } else if (request.type === "suggest") {
       const checker = await load(request.language);
-      self.postMessage({ id: request.id, type: "suggest", suggestions: checker.suggest(request.word).slice(0, 4) });
+      const correct = checker.correct(request.word) || request.personal[request.language].includes(request.word.toLocaleLowerCase(request.language));
+      self.postMessage({ id: request.id, type: "suggest", suggestions: correct ? [] : checker.suggest(request.word).slice(0, 6), correct });
     } else {
       const checker = await load(request.language);
       const prefix = request.prefix.toLocaleLowerCase(request.language);
