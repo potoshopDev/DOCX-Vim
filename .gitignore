@@ -1,6 +1,10 @@
 # User-provided DOCX examples remain local.
 /e/
 
+# Local agent instructions must not be published.
+/agents.md
+/AGENTS.md
+
 # JavaScript and frontend output.
 **/node_modules/
 **/dist/
