@@ -35,6 +35,12 @@ async function writeCloudStates(id: string, states: CloudStates): Promise<void> 
   await rename(temporary, filename(id), { oldPathBaseDir: BaseDirectory.AppData, newPathBaseDir: BaseDirectory.AppData });
 }
 
+export async function rememberOpenedRemote(id: string, provider: CloudProvider, path: string, revision: string): Promise<void> {
+  const states = await readCloudStates(id);
+  states[provider] = { path, revision, status: "saved", updatedAt: new Date().toISOString() };
+  await writeCloudStates(id, states);
+}
+
 export class CloudSync {
   private queues = new Map<CloudProvider, Queue>();
   private states: CloudStates = {};

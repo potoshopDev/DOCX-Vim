@@ -16,6 +16,7 @@ export type Draft = {
   scrollTop?: number;
 };
 const directory = "drafts";
+const pendingWrites = new Map<string, Promise<void>>();
 const key = (id: string) => `docx-vim-draft-${id}`;
 const path = (id: string) => {
   if (!/^[a-f\d-]{36}$/i.test(id)) throw new Error("Неверный ID документа");
@@ -53,10 +54,16 @@ export async function listDrafts(): Promise<Draft[]> {
 export async function writeDraft(draft: Draft): Promise<void> {
   const raw = JSON.stringify(draft);
   if (isTauri()) {
-    await mkdir(directory, { baseDir: BaseDirectory.AppData, recursive: true });
-    const destination = path(draft.id);
-    const temporary = `${destination}.tmp`;
-    await writeTextFile(temporary, raw, { baseDir: BaseDirectory.AppData });
-    await rename(temporary, destination, { oldPathBaseDir: BaseDirectory.AppData, newPathBaseDir: BaseDirectory.AppData });
+    const previous = pendingWrites.get(draft.id) ?? Promise.resolve();
+    const write = previous.catch(() => {}).then(async () => {
+      await mkdir(directory, { baseDir: BaseDirectory.AppData, recursive: true });
+      const destination = path(draft.id);
+      const temporary = `${destination}.tmp`;
+      await writeTextFile(temporary, raw, { baseDir: BaseDirectory.AppData });
+      await rename(temporary, destination, { oldPathBaseDir: BaseDirectory.AppData, newPathBaseDir: BaseDirectory.AppData });
+    });
+    pendingWrites.set(draft.id, write);
+    try { await write; }
+    finally { if (pendingWrites.get(draft.id) === write) pendingWrites.delete(draft.id); }
   } else localStorage.setItem(key(draft.id), raw);
 }

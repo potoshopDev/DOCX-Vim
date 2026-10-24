@@ -8,17 +8,21 @@ import { readFile } from "@tauri-apps/plugin-fs";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { importDocx } from "./docx";
 import { editorExtensions } from "./editor-extensions";
-import { listDrafts, readDraft, writeDraft, type Draft } from "./draft";
+import { listDrafts, writeDraft, type Draft } from "./draft";
 import { listRecent, rememberDocument, type RecentDocument } from "./library";
 import { defaultSettings, readSettings, writeSettings, type Settings } from "./settings";
 import { readPersonalDictionary, writePersonalDictionary, type Language, type PersonalDictionary } from "./personal-dictionary";
 import { openDocumentWindow, openWindowIds } from "./windows";
 import { beginYandex, completeOneDrive, completeYandex, disconnect, isConnected, requestOneDriveCode, type DeviceCode } from "./cloud-auth";
-import type { CloudProvider } from "./cloud-sync";
+import { rememberOpenedRemote, type CloudProvider } from "./cloud-sync";
+import { downloadYandexDocx, isRemoteTarget, listYandexDocx, type RemoteFile } from "./cloud-remote";
 
 export default function StartScreen() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [recent, setRecent] = useState<RecentDocument[]>([]);
+  const [yandexFiles, setYandexFiles] = useState<RemoteFile[]>([]);
+  const [showDrafts, setShowDrafts] = useState(false);
+  const [fileNotice, setFileNotice] = useState("");
   const [openIds, setOpenIds] = useState<string[]>([]);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [showSettings, setShowSettings] = useState(false);
@@ -36,6 +40,10 @@ export default function StartScreen() {
     const [savedDrafts, savedRecent, windows] = await Promise.all([listDrafts(), listRecent(), openWindowIds()]);
     setDrafts(savedDrafts); setRecent(savedRecent); setOpenIds(windows);
   }, []);
+  const refreshYandex = useCallback(async () => {
+    try { setYandexFiles(await listYandexDocx()); }
+    catch { setYandexFiles([]); setFileNotice("Список Яндекс Диска пока недоступен"); }
+  }, []);
   useEffect(() => {
     void refresh();
     void readSettings().then(setSettings);
@@ -51,6 +59,13 @@ export default function StartScreen() {
       isConnected("yandexDisk", settings.yandexClientId).catch(() => false),
     ]).then(([oneDrive, yandexDisk]) => setCloudConnected({ oneDrive, yandexDisk }));
   }, [settings.oneDriveClientId, settings.yandexClientId, cloudMessage]);
+  useEffect(() => {
+    if (!cloudConnected.yandexDisk) { setYandexFiles([]); return; }
+    void refreshYandex();
+    const onFocus = () => { void refreshYandex(); };
+    addEventListener("focus", onFocus);
+    return () => removeEventListener("focus", onFocus);
+  }, [cloudConnected.yandexDisk, refreshYandex]);
   useEffect(() => () => authAbort.current?.abort(), []);
   useEffect(() => {
     if (!isTauri() || /Android/i.test(navigator.userAgent)) return;
@@ -61,20 +76,50 @@ export default function StartScreen() {
     return () => { void listener.then((unlisten) => unlisten()); };
   }, []);
 
-  const openDraft = async (draft: Draft) => {
-    await rememberDocument({ id: draft.id, name: draft.name, sourcePath: draft.sourcePath });
+  const showDocument = async (draft: Draft) => {
+    if (draft.sourcePath) await rememberDocument({ id: draft.id, name: draft.name, sourcePath: draft.sourcePath });
     await openDocumentWindow(draft.id, draft.name);
     await refresh();
   };
 
-  const importBytes = async (bytes: Uint8Array, name: string, sourcePath?: string, id: string = crypto.randomUUID()) => {
+  const importBytes = async (bytes: Uint8Array, name: string, sourcePath?: string, id: string = crypto.randomUUID(), revision?: string) => {
     const imported = await importDocx(bytes);
     const draft: Draft = {
       version: 1, id, name, document: generateJSON(imported.html || "<p></p>", editorExtensions),
       updatedAt: new Date().toISOString(), sourcePath,
+      savePath: sourcePath && !isRemoteTarget(sourcePath) ? sourcePath : undefined,
+      cloudTargets: sourcePath?.startsWith("remote:yandexDisk:") ? { yandexDisk: sourcePath } : {},
     };
     await writeDraft(draft);
-    await openDraft(draft);
+    if (sourcePath?.startsWith("remote:yandexDisk:") && revision)
+      await rememberOpenedRemote(id, "yandexDisk", sourcePath, revision);
+    await showDocument(draft);
+  };
+
+  const openLocal = async (path: string, name?: string) => {
+    const existing = recent.find((item) => item.sourcePath === path);
+    const previous = drafts.find((draft) => draft.sourcePath === path);
+    const id = existing?.id ?? previous?.id ?? crypto.randomUUID();
+    if (openIds.includes(id)) { await openDocumentWindow(id, name ?? existing?.name ?? previous?.name ?? "Документ"); return; }
+    const bytes = await readFile(path);
+    const resolvedName = name ?? await basename(path).catch(() => path.split(/[\\/]/).pop() || "Документ.docx");
+    await importBytes(bytes, resolvedName, path, id);
+  };
+
+  const openYandex = async (path: string, name: string) => {
+    const existing = recent.find((item) => item.sourcePath === path);
+    const previous = drafts.find((draft) => draft.sourcePath === path);
+    const id = existing?.id ?? previous?.id ?? crypto.randomUUID();
+    if (openIds.includes(id)) { await openDocumentWindow(id, name); return; }
+    const { bytes, revision } = await downloadYandexDocx(path);
+    await importBytes(bytes, name, path, id, revision);
+  };
+
+  const openBackup = async (draft: Draft) => {
+    const backed = !!(draft.sourcePath || draft.savePath || Object.values(draft.cloudTargets ?? {}).some(Boolean));
+    const backup = backed ? { ...draft, id: crypto.randomUUID(), sourcePath: undefined, savePath: undefined, cloudTargets: {}, updatedAt: new Date().toISOString() } : draft;
+    if (backup !== draft) await writeDraft(backup);
+    await showDocument(backup);
   };
 
   const openFile = async () => {
@@ -84,17 +129,8 @@ export default function StartScreen() {
     try {
       const selected = await open({ multiple: false, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
       if (typeof selected !== "string") return;
-      const existingDraft = drafts.find((draft) => draft.sourcePath === selected);
-      if (existingDraft) { await openDraft(existingDraft); return; }
-      const existing = recent.find((item) => item.sourcePath === selected);
-      if (existing) {
-        const draft = await readDraft(existing.id);
-        if (draft) { await openDraft(draft); return; }
-      }
-      const bytes = await readFile(selected);
-      const name = await basename(selected).catch(() => selected.split(/[\\/]/).pop() || "Документ.docx");
-      await importBytes(bytes, name, selected, existing?.id);
-    } catch { /* The start screen keeps the user's documents available. */ }
+      await openLocal(selected);
+    } catch { setFileNotice("Не удалось открыть выбранный файл. Его черновик доступен отдельно."); }
     finally { setBusy(false); }
   };
 
@@ -108,7 +144,7 @@ export default function StartScreen() {
         updatedAt: new Date().toISOString(),
       };
       await writeDraft(draft);
-      await openDraft(draft);
+      await showDocument(draft);
     } catch { /* The draft is left on disk for recovery. */ }
     finally { setBusy(false); }
   };
@@ -117,10 +153,9 @@ export default function StartScreen() {
     if (busy) return;
     setBusy(true);
     try {
-      const draft = await readDraft(item.id);
-      if (draft) await openDraft(draft);
-      else if (item.sourcePath) await importBytes(await readFile(item.sourcePath), item.name, item.sourcePath, item.id);
-    } catch { /* A missing source does not remove the recent entry. */ }
+      if (item.sourcePath?.startsWith("remote:yandexDisk:")) await openYandex(item.sourcePath, item.name);
+      else if (item.sourcePath) await openLocal(item.sourcePath, item.name);
+    } catch { setFileNotice("Источник недоступен. Черновик можно открыть отдельно."); }
     finally { setBusy(false); }
   };
 
@@ -173,6 +208,18 @@ export default function StartScreen() {
     setCloudMessage(`${provider === "oneDrive" ? "OneDrive" : "Яндекс Диск"}: аккаунт отключён`);
   };
 
+  const recentFiles = recent.filter((item) => item.sourcePath && (!isRemoteTarget(item.sourcePath) || item.sourcePath.startsWith("remote:yandexDisk:")));
+  const knownPaths = new Set(recentFiles.map((item) => item.sourcePath));
+  for (const draft of drafts) {
+    const path = draft.cloudTargets?.yandexDisk;
+    if (path && !knownPaths.has(path)) {
+      recentFiles.push({ id: draft.sourcePath === path ? draft.id : "", name: draft.name, sourcePath: path, openedAt: draft.updatedAt });
+      knownPaths.add(path);
+    }
+  }
+  recentFiles.sort((a, b) => b.openedAt.localeCompare(a.openedAt));
+  const otherYandexFiles = yandexFiles.filter((file) => !knownPaths.has(file.path));
+
   return <main className="start-screen">
     <header className="start-header">
       <div><h1>DOCX Vim</h1><p>Документы и черновики</p></div>
@@ -182,6 +229,7 @@ export default function StartScreen() {
       <div className="start-actions">
         <button type="button" onClick={newDocument} disabled={busy}>Новый документ</button>
         <button type="button" onClick={openFile} disabled={busy}>Открыть DOCX</button>
+        <button type="button" onClick={() => setShowDrafts((value) => !value)} aria-expanded={showDrafts}>Черновики ({drafts.length})</button>
         <input ref={fileInput} type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden
           onChange={async (event) => {
             const file = event.target.files?.[0];
@@ -189,6 +237,7 @@ export default function StartScreen() {
             event.target.value = "";
           }} />
       </div>
+      {fileNotice && <p className="file-notice">{fileNotice}</p>}
       {showSettings && <section className="start-panel settings-panel" aria-label="Настройки приложения">
         <h2>Настройки</h2>
         <label>Автосохранение
@@ -266,20 +315,27 @@ export default function StartScreen() {
           <ul>{personal[settings.language].map((word) => <li key={word}>{word} <button type="button" onClick={() => changeDictionary(settings.language, personal[settings.language].filter((item) => item !== word))}>Удалить</button></li>)}</ul>
         </div>
       </section>}
-      <section className="start-panel"><h2>Черновики</h2>
-        {drafts.length ? <ul className="document-list">{drafts.map((draft) => <li key={draft.id}>
-          <button type="button" onClick={() => void openDraft(draft).catch(() => {})}>
-            <strong>{draft.name}</strong><span>{openIds.includes(draft.id) ? "Открыт · " : ""}{new Date(draft.updatedAt).toLocaleString("ru-RU")}</span>
-          </button>
-        </li>)}</ul> : <p className="empty-list">Пока нет черновиков</p>}
-      </section>
-      <section className="start-panel"><h2>Недавние документы</h2>
-        {recent.length ? <ul className="document-list">{recent.map((item) => <li key={item.id}>
+      <section className="start-panel"><h2>Недавние файлы</h2>
+        {recentFiles.length ? <ul className="document-list">{recentFiles.map((item) => <li key={item.sourcePath}>
           <button type="button" onClick={() => void openRecent(item)} disabled={busy}>
-            <strong>{item.name}</strong><span>{openIds.includes(item.id) ? "Открыт · " : ""}{new Date(item.openedAt).toLocaleString("ru-RU")}</span>
+            <strong>{item.name}</strong><span>{item.sourcePath?.startsWith("remote:yandexDisk:") ? "Яндекс Диск" : "Локальный"} · {openIds.includes(item.id) ? "Открыт · " : ""}{new Date(item.openedAt).toLocaleString("ru-RU")}</span>
           </button>
         </li>)}</ul> : <p className="empty-list">Открытые файлы появятся здесь</p>}
       </section>
+      {cloudConnected.yandexDisk && <section className="start-panel"><div className="section-heading"><h2>Яндекс Диск</h2><button type="button" onClick={() => void refreshYandex()} disabled={busy}>Обновить</button></div>
+        {otherYandexFiles.length ? <ul className="document-list">{otherYandexFiles.map((file) => <li key={file.path}>
+          <button type="button" disabled={busy} onClick={() => void openRecent({ id: "", name: file.name, sourcePath: file.path, openedAt: file.modified ?? "" })}>
+            <strong>{file.name}</strong><span>Яндекс Диск · {file.modified ? new Date(file.modified).toLocaleString("ru-RU") : "DOCX"}</span>
+          </button>
+        </li>)}</ul> : <p className="empty-list">Других файлов DOCX не найдено</p>}
+      </section>}
+      {showDrafts && <section className="start-panel"><h2>Черновики</h2><p className="draft-location">Резервные копии во внутреннем каталоге приложения: AppData/drafts. Открытие копии не меняет исходный файл.</p>
+        {drafts.length ? <ul className="document-list">{drafts.map((draft) => <li key={draft.id}>
+          <button type="button" disabled={busy} onClick={() => void openBackup(draft).catch(() => setFileNotice("Не удалось открыть черновик"))}>
+            <strong>{draft.name}</strong><span>Черновик · {new Date(draft.updatedAt).toLocaleString("ru-RU")}</span>
+          </button>
+        </li>)}</ul> : <p className="empty-list">Пока нет черновиков</p>}
+      </section>}
     </div>
   </main>;
 }

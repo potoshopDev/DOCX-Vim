@@ -76,6 +76,10 @@ button, select { font: inherit; }
 .start-actions { display: flex; gap: 0.7rem; flex-wrap: wrap; }
 .start-actions button:first-child { background: #245ca0; border-color: #245ca0; color: white; }
 .start-actions button:disabled, .document-list button:disabled { opacity: 0.5; }
+.file-notice, .draft-location { color: #687587; font-size: 0.85rem; margin: 0; }
+.draft-location { margin-bottom: 0.7rem; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.section-heading button { border: 1px solid #aeb9c8; border-radius: 0.4rem; background: white; padding: 0.35rem 0.6rem; }
 .start-panel { background: #fff; border: 1px solid #d6dde7; border-radius: 0.8rem; padding: 1rem; }
 .start-panel h2 { margin: 0 0 0.8rem; font-size: 1.05rem; }
 .empty-list { color: #697587; margin: 0; }

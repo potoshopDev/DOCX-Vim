@@ -5,6 +5,7 @@ import { readSettings } from "./settings";
 
 export class RemoteConflict extends Error {}
 type Meta = { revision: string; exists: boolean };
+export type RemoteFile = { name: string; path: string; modified?: string };
 const diskBase = "https://cloud-api.yandex.net/v1/disk/resources";
 
 export function remoteTarget(provider: CloudProvider, id: string, title: string): string {
@@ -14,13 +15,25 @@ export function remoteTarget(provider: CloudProvider, id: string, title: string)
 
 export function isRemoteTarget(path: string): boolean { return /^remote:(oneDrive|yandexDisk):/.test(path); }
 
+export function yandexTargetFromPath(path: string): string {
+  if (!path.startsWith("disk:/") || !path.toLowerCase().endsWith(".docx") || path.split("/").some((part) => part === ".."))
+    throw new Error("Invalid Yandex Disk path");
+  const relative = path.slice("disk:/".length);
+  return `remote:yandexDisk:${encodeURIComponent(relative.includes("/") ? path : relative)}`;
+}
+
 function targetName(provider: CloudProvider, target: string): string {
   const prefix = `remote:${provider}:`;
   if (!target.startsWith(prefix)) throw new Error("Invalid remote target");
   const name = decodeURIComponent(target.slice(prefix.length));
-  if (!name || name.includes("/") || name.includes("\\") || !name.toLowerCase().endsWith(".docx")) throw new Error("Invalid remote name");
+  if (!name || name.includes("\\") || !name.toLowerCase().endsWith(".docx") ||
+    (provider === "oneDrive" && name.includes("/")) ||
+    (provider === "yandexDisk" && name.includes("/") && (!name.startsWith("disk:/") || name.split("/").some((part) => part === ".."))))
+    throw new Error("Invalid remote name");
   return name;
 }
+
+const diskPath = (name: string) => name.startsWith("disk:/") ? name : `disk:/${name}`;
 
 async function credentials(provider: CloudProvider): Promise<{ token: string }> {
   const settings = await readSettings();
@@ -46,13 +59,48 @@ async function oneDriveMeta(name: string, token: string): Promise<Meta> {
 }
 
 async function yandexMeta(name: string, token: string): Promise<Meta> {
-  const url = `${diskBase}?${new URLSearchParams({ path: `disk:/${name}`, fields: "md5,modified,type" })}`;
+  const url = `${diskBase}?${new URLSearchParams({ path: diskPath(name), fields: "md5,modified,type" })}`;
   const response = await tauriFetch(url, { headers: { Authorization: `OAuth ${token}` } });
   if (response.status === 404) return { revision: "", exists: false };
   if (!response.ok) throw new Error(`Yandex metadata ${response.status}`);
   const data = await response.json() as { md5?: string; modified?: string; type?: string };
   if (data.type !== "file" || (!data.md5 && !data.modified)) throw new Error("Yandex metadata missing");
   return { revision: data.md5 ? `md5:${data.md5}` : `modified:${data.modified}`, exists: true };
+}
+
+export async function listYandexDocx(): Promise<RemoteFile[]> {
+  const { token } = await credentials("yandexDisk");
+  const files: RemoteFile[] = [];
+  for (let offset = 0; offset < 5000; offset += 200) {
+    const url = `${diskBase}/files?${new URLSearchParams({ limit: "200", offset: String(offset), fields: "items.name,items.path,items.modified" })}`;
+    const response = await tauriFetch(url, { headers: { Authorization: `OAuth ${token}` } });
+    if (!response.ok) throw new Error(`Yandex file list ${response.status}`);
+    const data = await response.json() as { items?: { name?: string; path?: string; modified?: string }[] };
+    const batch = data.items ?? [];
+    for (const item of batch) if (item.name?.toLowerCase().endsWith(".docx") && item.path?.startsWith("disk:/")) {
+      files.push({ name: item.name, path: yandexTargetFromPath(item.path), modified: item.modified });
+    }
+    if (batch.length < 200) break;
+  }
+  return files.sort((a, b) => (b.modified ?? "").localeCompare(a.modified ?? ""));
+}
+
+export async function downloadYandexDocx(target: string): Promise<{ bytes: Uint8Array; revision: string }> {
+  const name = targetName("yandexDisk", target);
+  const { token } = await credentials("yandexDisk");
+  const before = await yandexMeta(name, token);
+  if (!before.exists) throw new Error("Yandex document not found");
+  const url = `${diskBase}/download?${new URLSearchParams({ path: diskPath(name) })}`;
+  const linkResponse = await tauriFetch(url, { headers: { Authorization: `OAuth ${token}` } });
+  if (!linkResponse.ok) throw new Error(`Yandex download link ${linkResponse.status}`);
+  const link = await linkResponse.json() as { href?: string };
+  if (!link.href?.startsWith("https://")) throw new Error("Invalid Yandex download link");
+  const response = await tauriFetch(link.href);
+  if (!response.ok) throw new Error(`Yandex download ${response.status}`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const after = await yandexMeta(name, token);
+  if (!after.exists || before.revision !== after.revision) throw new RemoteConflict("Yandex document changed during download");
+  return { bytes, revision: after.revision };
 }
 
 export async function uploadRemote(provider: CloudProvider, target: string, bytes: Uint8Array, knownRevision?: string): Promise<string> {
@@ -72,7 +120,7 @@ export async function uploadRemote(provider: CloudProvider, target: string, byte
     if (!result.eTag) throw new Error("OneDrive revision missing");
     return result.eTag;
   }
-  const uploadUrl = `${diskBase}/upload?${new URLSearchParams({ path: `disk:/${name}`, overwrite: String(!!knownRevision) })}`;
+  const uploadUrl = `${diskBase}/upload?${new URLSearchParams({ path: diskPath(name), overwrite: String(!!knownRevision) })}`;
   const linkResponse = await tauriFetch(uploadUrl, { headers: { Authorization: `OAuth ${token}` } });
   if (linkResponse.status === 409 || linkResponse.status === 412) throw new RemoteConflict("Yandex version changed");
   if (!linkResponse.ok) throw new Error(`Yandex upload link ${linkResponse.status}`);

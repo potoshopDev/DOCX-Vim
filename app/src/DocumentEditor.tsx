@@ -16,6 +16,7 @@ import { CloudSync, cloudName, cloudProviders, type CloudProvider, type CloudSta
 import { isConnected } from "./cloud-auth";
 import { isRemoteTarget, remoteTarget } from "./cloud-remote";
 import { readDraft, writeDraft, type Draft } from "./draft";
+import { rememberDocument } from "./library";
 import { editorExtensions } from "./editor-extensions";
 import { readSettings } from "./settings";
 import { defaultSettings, type Settings } from "./settings";
@@ -50,8 +51,10 @@ function wordAtCaret(state: EditorState): { from: number; to: number; word: stri
 function DocumentEditor({ documentId }: { documentId: string }) {
   const [viewMode, setViewMode] = useState<ViewMode>("mobile");
   const [documentName, setDocumentName] = useState("Новый документ");
+  const [sourceLabel, setSourceLabel] = useState("Черновик");
   const [ready, setReady] = useState(false);
   const [revision, setRevision] = useState(0);
+  const [contentRevision, setContentRevision] = useState(0);
   const [saveStatus, setSaveStatus] = useState("Подготовка…");
   const [busy, setBusy] = useState(false);
   const [cloudStates, setCloudStates] = useState<CloudStates>({});
@@ -317,6 +320,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         setSelectedIssue(null);
         setCorrectionPending(false);
         setRevision((value) => value + 1);
+        setContentRevision((value) => value + 1);
         documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
       }
     },
@@ -369,6 +373,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       currentSavePath.current = draft.savePath;
       currentCloudTargets.current = draft.cloudTargets ?? {};
       setDocumentName(draft.name);
+      setSourceLabel(draft.sourcePath?.startsWith("remote:yandexDisk:") ? "Яндекс Диск" : draft.sourcePath ? "Локальный" : "Черновик");
       const mode = draft.viewMode || settings.defaultView;
       currentViewMode.current = mode;
       setViewMode(mode);
@@ -422,6 +427,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       editor.commands.setTextSelection({ from: Math.min(anchor, max), to: Math.min(head, max) });
       suppressUpdate.current = false;
       setRevision((value) => value + 1);
+      setContentRevision((value) => value + 1);
     };
     const onFocus = () => {
       if (!android && document.visibilityState === "hidden") return;
@@ -477,12 +483,15 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     return () => removeEventListener("focus", refreshSettings);
   }, [editor]);
   useEffect(() => {
-    if (!editor || !ready) return;
+    if (!editor || !ready || contentRevision === 0) return;
     setSaveStatus("Сохранение в фоне…");
     void isDocumentSaveOwner(documentId).then((owner) => {
       if (owner) saver.current!.schedule(currentDraft());
     });
-  }, [editor, ready, revision, documentId, documentName, viewMode]);
+  }, [editor, ready, contentRevision, documentId]);
+  useEffect(() => {
+    if (ready && editor) void writeDraft(currentDraft()).catch(() => {});
+  }, [ready, viewMode]);
   useEffect(() => {
     const retry = () => cloudSync.current?.retry();
     addEventListener("online", retry);
@@ -600,6 +609,12 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     if (!editor || busy || !ready) return false;
     setBusy(true);
     try {
+      if (currentSourcePath.current?.startsWith("remote:")) {
+        await persistCurrent();
+        cloudSync.current?.retry();
+        setSaveStatus("Сохранение в облако запущено");
+        return true;
+      }
       const baseName = documentName.replace(/\.docx$/i, "");
       const suggestedName = `${baseName}${currentSourcePath.current && !currentSavePath.current ? " (DOCX Vim)" : ""}.docx`;
       if (isTauri()) {
@@ -607,8 +622,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           const selected = await save({ defaultPath: suggestedName, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
           if (!selected) return false;
           currentSavePath.current = selected;
+          currentSourcePath.current = selected;
         }
         await persistCurrent();
+        if (currentSourcePath.current === currentSavePath.current && currentSourcePath.current) {
+          await rememberDocument({ id: documentId, name: documentName, sourcePath: currentSourcePath.current });
+          setSourceLabel("Локальный");
+        }
       } else {
         const blob = await exportDocx(editor.getJSON());
         const url = URL.createObjectURL(blob);
@@ -789,7 +809,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     <main className="app-shell">
       {!hideMenu && <header className="app-header">
         <div>
-          <h1>{documentName}</h1>
+          <h1>{documentName}</h1><small>{sourceLabel}</small>
         </div>
         <div className="file-actions" role="group" aria-label="Файл">
           <button type="button" onClick={() => void showLibrary()}>Документы</button>
