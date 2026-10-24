@@ -246,9 +246,11 @@ export default function StartScreen() {
             {cloudConnected.oneDrive && <button type="button" onClick={() => void disconnectCloud("oneDrive")}>Отключить</button>}
           </div>
           {oneDriveCode && <p>Откройте {oneDriveCode.verification_uri} и введите код <strong>{oneDriveCode.user_code}</strong></p>}
-          <label>Client ID приложения Яндекс OAuth
-            <input value={settings.yandexClientId} onChange={(event) => changeSetting({ yandexClientId: event.target.value })} placeholder="Идентификатор приложения Яндекс Диска" />
-          </label>
+          <details><summary>Другой Client ID Яндекс OAuth</summary>
+            <label>Client ID
+              <input value={settings.yandexClientId} onChange={(event) => changeSetting({ yandexClientId: event.target.value })} placeholder="Идентификатор приложения Яндекс Диска" />
+            </label>
+          </details>
           <div className="cloud-account-row"><span>Яндекс Диск: {cloudConnected.yandexDisk ? "подключён" : "не подключён"}</span>
             <button type="button" onClick={() => void connectYandex()}>Подключить</button>
             {cloudConnected.yandexDisk && <button type="button" onClick={() => void disconnectCloud("yandexDisk")}>Отключить</button>}

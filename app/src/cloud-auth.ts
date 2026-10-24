@@ -7,7 +7,7 @@ type TokenResponse = { access_token?: string; refresh_token?: string; expires_in
 export type DeviceCode = { device_code: string; user_code: string; verification_uri: string; interval: number; expires_in: number };
 const account = (provider: CloudProvider) => `docxvim.oauth.${provider}`;
 const microsoftBase = "https://login.microsoftonline.com/common/oauth2/v2.0";
-const yandexBase = "https://oauth.yandex.com";
+const yandexBase = "https://oauth.yandex.ru";
 
 async function postForm(url: string, fields: Record<string, string>): Promise<TokenResponse & Record<string, unknown>> {
   const response = await tauriFetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(fields) });
@@ -85,7 +85,7 @@ export async function beginYandex(clientId: string): Promise<{ url: string; veri
   const challenge = base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
   const url = new URL(`${yandexBase}/authorize`);
   url.search = new URLSearchParams({ response_type: "code", client_id: clientId,
-    redirect_uri: `${yandexBase}/verification_code`, scope: "cloud_api:disk.read,cloud_api:disk.write",
+    redirect_uri: `${yandexBase}/verification_code`, scope: "cloud_api:disk.read cloud_api:disk.write",
     code_challenge: challenge, code_challenge_method: "S256" }).toString();
   return { url: url.toString(), verifier };
 }

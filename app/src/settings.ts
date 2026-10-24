@@ -14,9 +14,11 @@ export type Settings = {
   oneDriveClientId: string;
   yandexClientId: string;
 };
+// OAuth client IDs identify public applications; tokens remain in the OS keyring.
+export const bundledYandexClientId = "4b1af7b720de4eb68675a6d3f5383425";
 export const defaultSettings: Settings = {
   autosaveMs: 800, language: "ru", vimLayout: "physical", defaultView: "mobile", vimEnabled: true, hideMenu: false,
-  autocorrect: true, autocomplete: true, grammarUrl: "", oneDriveClientId: "", yandexClientId: "",
+  autocorrect: true, autocomplete: true, grammarUrl: "", oneDriveClientId: "", yandexClientId: bundledYandexClientId,
 };
 const file = "library/settings.json";
 const storageKey = "docx-vim-settings";
@@ -37,7 +39,7 @@ export async function readSettings(): Promise<Settings> {
       autocomplete: value.autocomplete !== false,
       grammarUrl: typeof value.grammarUrl === "string" ? value.grammarUrl.trim() : "",
       oneDriveClientId: typeof value.oneDriveClientId === "string" ? value.oneDriveClientId.trim() : "",
-      yandexClientId: typeof value.yandexClientId === "string" ? value.yandexClientId.trim() : "",
+      yandexClientId: typeof value.yandexClientId === "string" && value.yandexClientId.trim() ? value.yandexClientId.trim() : bundledYandexClientId,
     };
   } catch { return defaultSettings; }
 }
