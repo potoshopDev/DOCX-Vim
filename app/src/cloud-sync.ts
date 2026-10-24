@@ -44,6 +44,7 @@ export async function rememberOpenedRemote(id: string, provider: CloudProvider, 
 
 export class CloudSync {
   private queues = new Map<CloudProvider, Queue>();
+  private retired = false;
   private states: CloudStates = {};
   private loaded = false;
   private loading?: Promise<void>;
@@ -61,6 +62,7 @@ export class CloudSync {
   }
 
   schedule(draft: Draft, bytes: Uint8Array): void {
+    if (this.retired) return;
     if (!this.loaded) { void this.load().then(() => this.schedule(draft, bytes)); return; }
     for (const provider of cloudProviders) {
       const path = draft.cloudTargets?.[provider];
@@ -106,6 +108,7 @@ export class CloudSync {
   }
 
   retry(): void {
+    if (this.retired) return;
     for (const provider of cloudProviders) {
       const queue = this.queues.get(provider);
       if (queue?.pending && !queue.running) void this.run(provider);
@@ -113,11 +116,12 @@ export class CloudSync {
   }
 
   private async run(provider: CloudProvider): Promise<void> {
+    if (this.retired) return;
     const queue = this.queues.get(provider);
     if (!queue || queue.running) return;
     queue.running = true;
     try {
-      while (queue.pending) {
+      while (queue.pending && !this.retired) {
         const pending = queue.pending;
         queue.pending = undefined;
         const state = this.states[provider];
@@ -165,6 +169,7 @@ export class CloudSync {
   }
 
   private setRetry(provider: CloudProvider, queue: Queue): void {
+    if (this.retired) return;
     if (queue.timer) clearTimeout(queue.timer);
     queue.timer = window.setTimeout(() => { queue.timer = undefined; void this.run(provider); }, retryDelay(++queue.attempts));
   }
@@ -191,5 +196,17 @@ export class CloudSync {
   private persist(): Promise<void> {
     this.writing = this.writing.catch(() => {}).then(() => writeCloudStates(this.id, { ...this.states }));
     return this.writing;
+  }
+
+  async retire(): Promise<void> {
+    this.retired = true;
+    for (const queue of this.queues.values()) {
+      if (queue.timer) clearTimeout(queue.timer);
+      queue.timer = undefined;
+      queue.pending = undefined;
+    }
+    while ([...this.queues.values()].some((queue) => queue.running))
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    await this.writing.catch(() => {});
   }
 }

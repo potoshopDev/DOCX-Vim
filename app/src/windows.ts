@@ -57,6 +57,8 @@ export async function focusAdjacentWindow(direction: number): Promise<void> {
 
 export async function isDocumentSaveOwner(id: string): Promise<boolean> {
   if (!isTauri()) return true;
+  const session = await invoke<{ editorLabel: string } | null>("get_document_session", { id });
+  if (session) return session.editorLabel === getCurrentWindow().label;
   const labels = (await WebviewWindow.getAll()).map((item) => item.label).filter((label) => label === labelFor(id) || label.startsWith(`${labelFor(id)}--`));
   labels.sort((a, b) => a.length - b.length || a.localeCompare(b));
   return labels[0] === getCurrentWindow().label;

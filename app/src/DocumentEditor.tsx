@@ -31,6 +31,7 @@ import { focusAdjacentWindow, isDocumentSaveOwner, openDocumentWindow, openWindo
 import "./App.css";
 
 type ViewMode = "page" | "mobile";
+type SessionSnapshot = { revision: number; editorLabel: string; draft: Draft; unconfirmedFrom?: string | null };
 type CorrectionItem = TextIssue | { kind: "none" | "pending"; from: number; to: number; word: string; suggestions: string[]; message: string };
 
 function wordAtCaret(state: EditorState): { from: number; to: number; word: string } | null {
@@ -100,6 +101,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   useEffect(() => { if (searchLine !== null) searchInput.current?.focus(); }, [searchLine]);
   const vim = useRef<VimAdapter | null>(null);
   const documentChannel = useRef<BroadcastChannel | null>(null);
+  const sessionRevision = useRef(-1);
+  const hasEditLease = useRef(false);
+  const cloudHandoffBlocked = useRef(false);
+  const handoffRecoveryId = useRef<string | null>(null);
+  const handoffBackupTimer = useRef<number | null>(null);
+  const publicationQueue = useRef<Promise<void>>(Promise.resolve());
+  const publicationFailed = useRef(false);
   const suppressUpdate = useRef(false);
   const editorArea = useRef<HTMLElement>(null);
   const currentId = useRef(documentId);
@@ -117,7 +125,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   if (!cloudSync.current) cloudSync.current = new CloudSync(documentId, setCloudStates);
   if (!saver.current) saver.current = new BackgroundSaver((_id, path) => {
     setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-  }, 800, (draft, bytes) => cloudSync.current?.schedule(draft, bytes), () => setLocalConflict(true),
+  }, 800, (draft, bytes) => { if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(draft, bytes); }, () => setLocalConflict(true),
   (revision) => { currentSourceFingerprint.current = revision; });
   const currentDraft = (): Draft => ({
     version: 1, id: currentId.current, name: currentName.current,
@@ -130,10 +138,40 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     selection: editor ? { anchor: editor.state.selection.anchor, head: editor.state.selection.head } : undefined,
     scrollTop: editorArea.current?.scrollTop,
   });
+  const writeHandoffBackup = (draft: Draft): Promise<void> => {
+    handoffRecoveryId.current ??= crypto.randomUUID();
+    return writeDraft({ ...draft, id: handoffRecoveryId.current,
+      name: `${draft.name.replace(/\.docx$/i, "")} — версия при переключении окон`,
+      sourcePath: undefined, restoreSourcePath: draft.sourcePath ?? draft.restoreSourcePath,
+      sourceFingerprint: undefined, savePath: undefined, cloudTargets: {}, updatedAt: new Date().toISOString() });
+  };
+  const scheduleHandoffBackup = (draft: Draft) => {
+    if (handoffBackupTimer.current !== null) clearTimeout(handoffBackupTimer.current);
+    handoffBackupTimer.current = window.setTimeout(() => {
+      handoffBackupTimer.current = null;
+      void writeHandoffBackup(draft).catch(() => {});
+    }, 500);
+  };
+  const publishCurrent = (): Promise<void> => {
+    if (!isTauri() || !hasEditLease.current || !currentReady.current) return publicationQueue.current;
+    const draft = currentDraft();
+    publicationQueue.current = publicationQueue.current.then(async () => {
+      const snapshot = await invoke<SessionSnapshot>("publish_document_session", { id: documentId, draft });
+      sessionRevision.current = Math.max(sessionRevision.current, snapshot.revision);
+    }).catch(async () => {
+      publicationFailed.current = true;
+      hasEditLease.current = false;
+      editor?.setEditable(false);
+      setSaveStatus("Не удалось передать изменение между окнами");
+      await preserveDraftVersion(draft).catch(() => {});
+      throw new Error("Document publication failed");
+    });
+    return publicationQueue.current;
+  };
   const correctionChoiceCount = (issue: CorrectionItem) => issue.kind === "none" || issue.kind === "pending" ? 1 : issue.suggestions.length + (issue.kind === "spelling" ? 3 : 2);
   const applyCorrectionChoice = (index: number): boolean => {
     const issue = selectedIssueRef.current;
-    if (!issue || !editor) return false;
+    if (!issue || !editor || (isTauri() && !hasEditLease.current)) return false;
     const suggestionCount = issue.suggestions.length;
     if (index < 0 || index >= correctionChoiceCount(issue)) return false;
     if (index < suggestionCount) {
@@ -235,6 +273,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const editorHandlers = useRef<EditorProps>({});
   editorHandlers.current = {
       handleKeyDown: (_view, event) => {
+        if (isTauri() && (!hasEditLease.current || !_view.editable)) { event.preventDefault(); return true; }
         const editable = !vim.current?.enabled || vim.current?.mode() === "insert";
         const correctionKey = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
           ? event.code === "KeyN" || ["n", "N", "т", "Т"].includes(event.key) ? 1
@@ -282,6 +321,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         return vim.current?.handle(event) ?? false;
       },
       handleTextInput: (view, from, to, text) => {
+        if (isTauri() && !hasEditLease.current) return true;
         if (!assistSettingsRef.current.autocorrect || (vim.current?.enabled && vim.current.mode() !== "insert")) return false;
         const $from = view.state.doc.resolve(from);
         const before = $from.parent.textBetween(Math.max(0, $from.parentOffset - 2), $from.parentOffset);
@@ -298,6 +338,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         return false;
       },
       handleClick: (_view, pos) => {
+        if (isTauri() && !hasEditLease.current) return false;
         const issue = issuesRef.current.find((item) => item.from <= pos && pos <= item.to);
         selectedIssueRef.current = issue ?? null;
         correctionPendingRef.current = false;
@@ -332,6 +373,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const editor = useEditor({
     extensions: stableExtensions,
     content: "<p></p>",
+    editable: false,
     editorProps: stableEditorProps,
     onUpdate: () => {
       if (!suppressUpdate.current) {
@@ -342,7 +384,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         setCorrectionPending(false);
         setRevision((value) => value + 1);
         setContentRevision((value) => value + 1);
-        documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
+        if (isTauri()) void publishCurrent().catch(() => {});
+        else documentChannel.current?.postMessage({ type: "document", document: editor?.getJSON() });
       }
     },
     onTransaction: ({ editor: current, transaction }) => {
@@ -384,7 +427,16 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     Promise.all([readDraft(documentId), readSettings()]).then(async ([storedDraft, settings]) => {
       if (cancelled || !storedDraft) return;
       let draft = storedDraft;
-      if (draft.sourcePath && await isDocumentSaveOwner(documentId)) {
+      let session = isTauri() ? await invoke<SessionSnapshot | null>("get_document_session", { id: documentId }) : null;
+      if (isTauri() && !session && !(await isDocumentSaveOwner(documentId))) {
+        for (let attempt = 0; attempt < 100 && !cancelled && !session; attempt++) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          session = await invoke<SessionSnapshot | null>("get_document_session", { id: documentId });
+          if (await isDocumentSaveOwner(documentId)) break;
+        }
+      }
+      if (isTauri() && !session && !(await isDocumentSaveOwner(documentId))) throw new Error("Document owner has not opened the session");
+      if (!session && draft.sourcePath && await isDocumentSaveOwner(documentId)) {
         try {
           const source = draft.sourcePath;
           const remote = source.startsWith("remote:yandexDisk:");
@@ -403,14 +455,17 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           };
           await replaceSourceDraft(draft);
           if (remote && revision) await rememberOpenedRemote(documentId, "yandexDisk", source, revision);
-          if (isTauri()) for (const other of await WebviewWindow.getAll()) {
-            if (other.label !== getCurrentWindow().label && (other.label === `doc-${documentId}` || other.label.startsWith(`doc-${documentId}--`)))
-              void emitTo(other.label, "source-reload").catch(() => {});
-          }
         } catch {
           await showLibrary().catch(() => {});
           return;
         }
+      }
+      if (isTauri()) {
+        session ??= await invoke<SessionSnapshot>("join_document_session", { id: documentId, draft });
+        draft = session.draft;
+        sessionRevision.current = session.revision;
+        hasEditLease.current = session.editorLabel === getCurrentWindow().label;
+        cloudHandoffBlocked.current = !!session.unconfirmedFrom;
       }
       await cloudSync.current?.load();
       if (cancelled) return;
@@ -419,8 +474,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       setAssistSettings(settings);
       saver.current = new BackgroundSaver((_id, path) => {
         setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-      }, settings.autosaveMs, (savedDraft, bytes) => cloudSync.current?.schedule(savedDraft, bytes),
-      () => setLocalConflict(true), (revision) => { currentSourceFingerprint.current = revision; });
+      }, settings.autosaveMs, (savedDraft, bytes) => {
+        if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(savedDraft, bytes);
+      },
+      () => setLocalConflict(true), (revision) => {
+        currentSourceFingerprint.current = revision;
+        if (isTauri()) void invoke("update_document_source_fingerprint", { id: documentId, fingerprint: revision }).catch(() => {});
+      });
       suppressUpdate.current = true;
       editor.chain().setMeta("addToHistory", false).setContent(draft.document, { emitUpdate: false }).run();
       suppressUpdate.current = false;
@@ -442,7 +502,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       }
       currentReady.current = true;
       setReady(true);
-      requestAnimationFrame(() => editor.commands.focus());
+      if (!isTauri() || hasEditLease.current) requestAnimationFrame(() => editor.commands.focus());
       setSaveStatus("Готово");
       void registerDocumentTask(isTauri() ? getCurrentWindow().label.slice(4) : documentId, draft.name);
       if (draft.scrollTop != null) requestAnimationFrame(() => {
@@ -452,8 +512,208 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     }).catch(() => setSaveStatus(""));
     return () => { cancelled = true; };
   }, [editor, documentId]);
+  const applySessionSnapshot = (snapshot: SessionSnapshot, force = false) => {
+    if (!editor || snapshot.draft.id !== documentId || (!force && snapshot.revision <= sessionRevision.current)) return;
+    sessionRevision.current = snapshot.revision;
+    cloudHandoffBlocked.current = !!snapshot.unconfirmedFrom;
+    const draft = snapshot.draft;
+    currentName.current = draft.name;
+    currentSourcePath.current = draft.sourcePath;
+    currentRestoreSourcePath.current = draft.restoreSourcePath;
+    currentSourceFingerprint.current = draft.sourceFingerprint;
+    currentSavePath.current = draft.savePath;
+    currentCloudTargets.current = draft.cloudTargets ?? {};
+    setDocumentName(draft.name);
+    setSourceLabel(draft.sourcePath?.startsWith("remote:yandexDisk:") ? "Яндекс Диск" : draft.sourcePath ? "Локальный" : "Черновик");
+    if (force || snapshot.editorLabel !== getCurrentWindow().label) {
+      const anchor = editor.state.selection.anchor;
+      const head = editor.state.selection.head;
+      suppressUpdate.current = true;
+      try {
+        editor.chain().setMeta("addToHistory", false).setContent(draft.document, { emitUpdate: false }).run();
+        const max = editor.state.doc.content.size;
+        editor.commands.setTextSelection({ from: Math.min(anchor, max), to: Math.min(head, max) });
+      } finally { suppressUpdate.current = false; }
+      setRevision((value) => value + 1);
+      setContentRevision((value) => value + 1);
+    }
+  };
   useEffect(() => {
     if (!editor || !ready) return;
+    if (isTauri()) {
+      const label = getCurrentWindow().label;
+      let stopped = false;
+      let acquiring = false;
+      let yielding = false;
+      let queuedSaveRevision = sessionRevision.current;
+      let wasSaveOwner = hasEditLease.current;
+      const checkSaveOwner = async () => {
+        if (yielding) return;
+        const owner = await isDocumentSaveOwner(documentId);
+        if (stopped || yielding) return;
+        if (owner && wasSaveOwner && cloudHandoffBlocked.current) {
+          const snapshot = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
+          if (!snapshot.unconfirmedFrom) {
+            cloudHandoffBlocked.current = false;
+            applySessionSnapshot(snapshot);
+            saver.current?.schedule(snapshot.draft);
+          }
+        }
+        if (owner && wasSaveOwner !== true) {
+          if (wasSaveOwner === false) {
+            cloudSync.current = new CloudSync(documentId, setCloudStates);
+            await cloudSync.current.load();
+          }
+          const snapshot = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
+          cloudHandoffBlocked.current = !!snapshot.unconfirmedFrom;
+          if (snapshot.revision > 0 || wasSaveOwner === false) {
+            queuedSaveRevision = Math.max(queuedSaveRevision, snapshot.revision);
+            if (snapshot.unconfirmedFrom) scheduleHandoffBackup(snapshot.draft);
+            else saver.current?.schedule(snapshot.draft);
+          }
+          if (wasSaveOwner === false && document.visibilityState === "visible") void onFocus();
+        }
+        wasSaveOwner = owner;
+      };
+      const onSnapshot = (snapshot: SessionSnapshot) => {
+        if (snapshot.draft.id !== documentId || snapshot.revision < sessionRevision.current) return;
+        cloudHandoffBlocked.current = !!snapshot.unconfirmedFrom;
+        if (snapshot.editorLabel !== label && hasEditLease.current) {
+          hasEditLease.current = false;
+          editor.setEditable(false);
+          wasSaveOwner = false;
+          void cloudSync.current?.retire().catch(() => {});
+          setRevision((value) => value + 1);
+        }
+        if (snapshot.unconfirmedFrom === label && snapshot.editorLabel !== label)
+          void cloudSync.current?.retire().then(() => invoke("confirm_document_handoff", { id: documentId })).catch(() => {});
+        applySessionSnapshot(snapshot);
+        if (snapshot.revision > queuedSaveRevision) {
+          queuedSaveRevision = snapshot.revision;
+          void isDocumentSaveOwner(documentId).then((owner) => {
+            if (owner && !stopped && !yielding && snapshot.revision === queuedSaveRevision) {
+              if (snapshot.unconfirmedFrom) scheduleHandoffBackup(snapshot.draft);
+              else saver.current?.schedule(snapshot.draft);
+            }
+          });
+        }
+      };
+      const onFocus = async () => {
+        if (stopped || yielding || publicationFailed.current || conflictInProgress.current || (document.visibilityState === "hidden" && !/Android/i.test(navigator.userAgent)) || acquiring) return;
+        acquiring = true;
+        editor.setEditable(false);
+        try {
+          const current = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
+          cloudHandoffBlocked.current = !!current.unconfirmedFrom;
+          if (current.unconfirmedFrom === label && current.editorLabel !== label) {
+            await cloudSync.current?.retire();
+            await invoke("confirm_document_handoff", { id: documentId });
+            wasSaveOwner = false;
+          }
+          if (current.editorLabel === label) {
+            applySessionSnapshot(current, current.revision > sessionRevision.current || !hasEditLease.current);
+            hasEditLease.current = true;
+            editor.setEditable(true);
+            setRevision((value) => value + 1);
+            requestAnimationFrame(() => editor.commands.focus());
+            return;
+          }
+          hasEditLease.current = false;
+          const snapshot = await invoke<SessionSnapshot>("acquire_document_session", { id: documentId });
+          if (stopped) return;
+          applySessionSnapshot(snapshot, true);
+          hasEditLease.current = true;
+          await checkSaveOwner();
+          editor.setEditable(true);
+          setRevision((value) => value + 1);
+          requestAnimationFrame(() => editor.commands.focus());
+        } catch { if (!stopped) setSaveStatus("Не удалось передать право редактирования"); }
+        finally { acquiring = false; }
+      };
+      const onYield = async (payload: { id: string; editorLabel: string }) => {
+        if (payload.id !== documentId || payload.editorLabel !== label || !hasEditLease.current || yielding) return;
+        yielding = true;
+        editor.setEditable(false);
+        setRevision((value) => value + 1);
+        selectedIssueRef.current = null;
+        setSelectedIssue(null);
+        setCompletion(null);
+        setCommandLine(null);
+        setSearchLine(null);
+        try {
+          await publicationQueue.current;
+          const snapshot = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
+          await saver.current?.flush(snapshot.draft);
+          if (currentSourceFingerprint.current) await invoke("update_document_source_fingerprint", {
+            id: documentId, fingerprint: currentSourceFingerprint.current,
+          });
+          await cloudSync.current?.retire();
+          wasSaveOwner = false;
+          await invoke("release_document_session", { id: documentId });
+          hasEditLease.current = false;
+          yielding = false;
+        } catch { setSaveStatus("Не удалось передать изменение между окнами"); }
+      };
+      const onSaveRequest = async (payload: { id: string; token: string; replyTo: string }) => {
+        if (payload.id !== documentId) return;
+        let ok = false;
+        try {
+          const snapshot = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
+          if (!yielding && snapshot.editorLabel === label) {
+            if (snapshot.unconfirmedFrom) await writeHandoffBackup(snapshot.draft);
+            else { await saver.current?.flush(snapshot.draft); ok = true; }
+          }
+        } catch { /* The requester keeps its window open when saving fails. */ }
+        await emitTo(payload.replyTo, "docx-vim-save-result", { token: payload.token, ok }).catch(() => {});
+      };
+      const listeners = Promise.all([
+        listen<SessionSnapshot>("docx-vim-session", (event) => onSnapshot(event.payload)),
+        listen<SessionSnapshot>("docx-vim-lease", (event) => {
+          if (event.payload.draft.id !== documentId) return;
+          if (event.payload.editorLabel !== label) { hasEditLease.current = false; editor.setEditable(false); }
+          if (event.payload.unconfirmedFrom === label && event.payload.editorLabel !== label)
+            void cloudSync.current?.retire().then(() => invoke("confirm_document_handoff", { id: documentId })).catch(() => {});
+          setRevision((value) => value + 1);
+          applySessionSnapshot(event.payload);
+        }),
+        listen<SessionSnapshot>("docx-vim-fingerprint", (event) => {
+          if (event.payload.draft.id === documentId) currentSourceFingerprint.current = event.payload.draft.sourceFingerprint;
+        }),
+        listen<SessionSnapshot>("docx-vim-handoff-confirmed", (event) => {
+          if (event.payload.draft.id !== documentId || event.payload.revision < sessionRevision.current) return;
+          cloudHandoffBlocked.current = false;
+          applySessionSnapshot(event.payload);
+          setRevision((value) => value + 1);
+          void isDocumentSaveOwner(documentId).then((owner) => {
+            if (owner && !stopped) saver.current?.schedule(event.payload.draft);
+          });
+        }),
+        listen<{ id: string; editorLabel: string }>("docx-vim-yield", (event) => { void onYield(event.payload); }),
+        getCurrentWindow().listen<{ id: string; token: string; replyTo: string }>("docx-vim-save-request", (event) => { void onSaveRequest(event.payload); }),
+        getCurrentWindow().listen("focus-editor", () => { void onFocus(); }),
+        getCurrentWindow().listen("tauri://resumed", () => { void onFocus(); }),
+      ]).then(async (unlisteners) => {
+        if (stopped) { unlisteners.forEach((stop) => stop()); return []; }
+        const latest = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
+        onSnapshot(latest);
+        void checkSaveOwner().catch(() => {});
+        void onFocus();
+        return unlisteners;
+      });
+      const ownerTimer = window.setInterval(() => { void checkSaveOwner().catch(() => {}); }, 2_000);
+      const focus = () => { void onFocus(); };
+      const visible = () => { if (document.visibilityState === "visible") void onFocus(); };
+      addEventListener("focus", focus);
+      document.addEventListener("visibilitychange", visible);
+      return () => {
+        stopped = true;
+        clearInterval(ownerTimer);
+        if (handoffBackupTimer.current !== null) clearTimeout(handoffBackupTimer.current);
+        removeEventListener("focus", focus);
+        document.removeEventListener("visibilitychange", visible);
+        void listeners.then((unlisteners) => unlisteners.forEach((stop) => stop()));
+      };
+    }
     const channel = new BroadcastChannel(`docx-vim-${documentId}`);
     const android = isTauri() && /Android/i.test(navigator.userAgent);
     documentChannel.current = channel;
@@ -533,17 +793,18 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     setVimMode(vim.current.mode());
     return () => { vim.current = null; };
   }, [editor, vimEnabled, documentId, documentName]);
-  useEffect(() => { editor?.setEditable(ready); }, [editor, ready]);
+  useEffect(() => { if (!isTauri()) editor?.setEditable(ready); }, [editor, ready]);
   useEffect(() => {
     const refreshSettings = () => { void readSettings().then((settings) => {
       setVimEnabled(settings.vimEnabled); setHideMenu(settings.hideMenu);
       setAssistSettings(settings);
-    }); void readPersonalDictionary().then(setPersonal); if (currentReady.current) requestAnimationFrame(() => editor?.commands.focus()); };
+    }); void readPersonalDictionary().then(setPersonal); if (currentReady.current && (!isTauri() || hasEditLease.current)) requestAnimationFrame(() => editor?.commands.focus()); };
     addEventListener("focus", refreshSettings);
     return () => removeEventListener("focus", refreshSettings);
   }, [editor]);
   useEffect(() => {
     if (!editor || !ready || contentRevision === 0 || conflictInProgress.current) return;
+    if (isTauri()) return;
     setSaveStatus("Сохранение в фоне…");
     void isDocumentSaveOwner(documentId).then((owner) => {
       if (owner) saver.current!.schedule(currentDraft());
@@ -561,7 +822,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       try {
         if (!(await isDocumentSaveOwner(documentId))) return;
         await saver.current?.suspend(documentId);
-        await preserveDraftVersion(currentDraft());
+        const authoritative = isTauri()
+          ? (await invoke<SessionSnapshot>("get_document_session", { id: documentId })).draft
+          : currentDraft();
+        await preserveDraftVersion(authoritative);
         preserved = true;
         const remote = source.startsWith("remote:yandexDisk:");
         const { bytes, revision } = remote
@@ -569,7 +833,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           : { bytes: await readFile(source), revision: undefined };
         const imported = await importDocx(bytes);
         const mainDraft: Draft = {
-          ...currentDraft(),
+          ...authoritative,
           document: generateJSON(imported.html || "<p></p>", editorExtensions),
           sourcePath: source,
           sourceFingerprint: remote ? undefined : await fingerprint(bytes),
@@ -581,7 +845,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         };
         await writeDraft(mainDraft);
         if (remote && revision) await cloudSync.current?.acceptOpenedRemote("yandexDisk", source, revision);
-        documentChannel.current?.postMessage({ type: "source-reload" });
+        if (isTauri()) {
+          await invoke("reset_document_session", { id: documentId, draft: mainDraft });
+          for (const other of await WebviewWindow.getAll()) {
+            if (other.label !== getCurrentWindow().label && (other.label === `doc-${documentId}` || other.label.startsWith(`doc-${documentId}--`)))
+              void emitTo(other.label, "source-reload").catch(() => {});
+          }
+        } else documentChannel.current?.postMessage({ type: "source-reload" });
         location.reload();
       } catch {
         setSaveStatus(preserved ? "Версия сохранена в черновиках" : "");
@@ -596,7 +866,14 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     })();
   }, [editor, ready, localConflict, cloudStates.yandexDisk?.status, documentId]);
   useEffect(() => {
-    if (ready && editor) void writeDraft(currentDraft()).catch(() => {});
+    if (ready && editor) void isDocumentSaveOwner(documentId).then((owner) => {
+      if (!owner) return;
+      if (isTauri()) void invoke<SessionSnapshot>("get_document_session", { id: documentId })
+        .then((snapshot) => snapshot.unconfirmedFrom
+          ? writeHandoffBackup(snapshot.draft)
+          : writeDraft({ ...snapshot.draft, viewMode })).catch(() => {});
+      else void writeDraft(currentDraft()).catch(() => {});
+    });
   }, [ready, viewMode]);
   useEffect(() => {
     const retry = () => cloudSync.current?.retry();
@@ -656,6 +933,39 @@ function DocumentEditor({ documentId }: { documentId: string }) {
 
   const persistCurrent = async (draftIsEnough = false) => {
     if (!editor || !currentReady.current) return;
+    if (isTauri()) {
+      if (hasEditLease.current) await publishCurrent();
+      await publicationQueue.current;
+      const snapshot = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
+      if (snapshot.unconfirmedFrom) {
+        await writeHandoffBackup(snapshot.draft);
+        if (draftIsEnough) return;
+        throw new Error("Waiting for previous window to finish saving");
+      }
+      if (await isDocumentSaveOwner(documentId)) {
+        try { await saver.current!.flush(snapshot.draft); }
+        catch (error) {
+          if (!draftIsEnough || !(error instanceof BackgroundSaveFailure && error.draftSaved)) throw error;
+        }
+        return;
+      }
+      if (!snapshot.editorLabel) throw new Error("Save owner missing");
+      const token = crypto.randomUUID();
+      await new Promise<void>((resolve, reject) => {
+        let stop: (() => void) | undefined;
+        const timer = window.setTimeout(() => { stop?.(); reject(new Error("Save request timed out")); }, 20_000);
+        void getCurrentWindow().listen<{ token: string; ok: boolean }>("docx-vim-save-result", (event) => {
+          if (event.payload.token !== token) return;
+          clearTimeout(timer); stop?.();
+          if (event.payload.ok) resolve(); else reject(new Error("Save request failed"));
+        }).then((unlisten) => {
+          stop = unlisten;
+          void emitTo(snapshot.editorLabel, "docx-vim-save-request", { id: documentId, token, replyTo: getCurrentWindow().label })
+            .catch((error) => { clearTimeout(timer); stop?.(); reject(error); });
+        }).catch((error) => { clearTimeout(timer); reject(error); });
+      });
+      return;
+    }
     if (!(await isDocumentSaveOwner(documentId)) && documentChannel.current) {
       await writeDraft(currentDraft());
       documentChannel.current.postMessage({ type: "save-request", savePath: currentSavePath.current, cloudTargets: currentCloudTargets.current });
@@ -671,7 +981,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const listener = onBackButtonPress(() => {
       void (async () => {
         try { await persistCurrent(true); } catch { return; }
-        if (getCurrentWindow().label.startsWith("doc-")) await invoke("close_task");
+        if (getCurrentWindow().label.startsWith("doc-")) {
+          await invoke("leave_document_session", { id: documentId });
+          await invoke("close_task");
+        }
         else await showLibrary();
       })();
     });
@@ -682,7 +995,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const saveWhenHidden = () => {
       if (document.visibilityState === "hidden" && currentReady.current) {
         void isDocumentSaveOwner(documentId).then((owner) => {
-          if (owner) void saver.current!.flush(currentDraft()).catch(() => {});
+          if (owner) void (async () => {
+            const snapshot = isTauri()
+              ? await invoke<SessionSnapshot>("get_document_session", { id: documentId })
+              : null;
+            if (snapshot?.unconfirmedFrom) await writeHandoffBackup(snapshot.draft);
+            else await saver.current!.flush(snapshot?.draft ?? currentDraft());
+          })().catch(() => {});
         });
       }
     };
@@ -699,6 +1018,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       try {
         await persistCurrent(true);
         if (windowHandle.label !== "main" && (await openWindowIds()).length <= 1) await showLibrary();
+        await invoke("leave_document_session", { id: documentId });
         await windowHandle.destroy();
       } catch {
         closing = false;
@@ -712,7 +1032,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   }, [editor]);
 
   const saveDocument = async (): Promise<boolean> => {
-    if (!editor || busy || !ready) return false;
+    if (!editor || busy || !ready || cloudHandoffBlocked.current) return false;
     setBusy(true);
     try {
       if (currentSourcePath.current?.startsWith("remote:")) {
@@ -765,19 +1085,26 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const quitDocument = async (): Promise<void> => {
     try { await persistCurrent(true); } catch { return; }
     if (isTauri() && /Android/i.test(navigator.userAgent) && getCurrentWindow().label.startsWith("doc-")) {
+      await invoke("leave_document_session", { id: documentId });
       await invoke("close_task");
       return;
     }
     await showLibrary();
-    if (isTauri() && getCurrentWindow().label !== "main") await getCurrentWindow().destroy();
+    if (isTauri() && getCurrentWindow().label !== "main") {
+      await invoke("leave_document_session", { id: documentId });
+      await getCurrentWindow().destroy();
+    }
   };
 
   const writeQuitAll = async (): Promise<void> => {
     if (!isTauri()) { if (await saveDocument()) await quitDocument(); return; }
     const windows = (await WebviewWindow.getAll()).filter((item) => item.label.startsWith("doc-"));
     if (!windows.length) { if (await saveDocument()) await quitDocument(); return; }
-    const owners = [...new Map(windows.slice().sort((a, b) => a.label.length - b.label.length || a.label.localeCompare(b.label))
-      .map((item) => [item.label.slice(4).split("--")[0], item])).values()];
+    const ids = [...new Set(windows.map((item) => item.label.slice(4).split("--")[0]))];
+    const owners = (await Promise.all(ids.map(async (id) => {
+      const session = await invoke<SessionSnapshot | null>("get_document_session", { id });
+      return windows.find((item) => item.label === session?.editorLabel);
+    }))).filter((item): item is WebviewWindow => !!item);
     for (const owner of owners) {
       if (owner.label === getCurrentWindow().label) {
         if (!(await saveDocument())) return;
@@ -872,7 +1199,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       aria-label={title}
       aria-pressed={selected}
       onClick={action}
-      disabled={!editor}
+      disabled={!editor || !editor.isEditable}
     >
       {label}
     </button>
@@ -887,7 +1214,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         <div className="file-actions" role="group" aria-label="Файл">
           <button type="button" onClick={() => void showLibrary()}>Документы</button>
           <button type="button" onClick={() => void showYandexLibrary()}>Яндекс Диск</button>
-          <button type="button" onClick={saveDocument} disabled={!editor || busy || !ready}>Сохранить DOCX</button>
+          <button type="button" onClick={saveDocument} disabled={!editor || busy || !ready || cloudHandoffBlocked.current || (isTauri() && !hasEditLease.current)}>Сохранить DOCX</button>
           {cloudProviders.filter((provider) => cloudStates[provider]?.status === "conflict").map((provider) =>
             <button key={provider} type="button" onClick={() => void exportConflict(provider)}>Сохранить конфликтную копию {provider === "yandexDisk" ? "Яндекса" : "OneDrive"}</button>)}
         </div>
@@ -905,7 +1232,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         <select
           aria-label="Стиль абзаца"
           value={active?.heading1 ? "h1" : active?.heading2 ? "h2" : active?.heading3 ? "h3" : "p"}
-          disabled={!editor}
+          disabled={!editor || !editor.isEditable}
           onChange={(event) => {
             const value = event.target.value;
             if (value === "p") editor?.chain().focus().setParagraph().run();
@@ -974,7 +1301,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       </div>}
 
       <footer className="status-bar">
-        <span>{vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
+        <span>{isTauri() && !hasEditLease.current ? "Просмотр — редактирование в другом окне"
+          : cloudHandoffBlocked.current ? "Ожидаем сохранения из предыдущего окна; изменения в резервном черновике"
+          : vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
         {completion && <span className="completion-hint">{completion.suggestion} · Tab / Ctrl+Space</span>}
         {commandLine !== null && <label className="vim-command">:
           <input ref={commandInput} aria-label="Команда Vim" value={commandLine}

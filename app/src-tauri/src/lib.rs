@@ -1,3 +1,5 @@
+mod document_session;
+
 #[cfg(target_os = "android")]
 fn android_task_method(window: tauri::WebviewWindow, method: &'static str, id: String, name: String) -> Result<(), String> {
     use jni::objects::{JObject, JValue};
@@ -42,7 +44,13 @@ fn close_task(window: tauri::WebviewWindow) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![register_task, focus_task, close_task])
+        .manage(document_session::DocumentSessions::default())
+        .invoke_handler(tauri::generate_handler![register_task, focus_task, close_task,
+            document_session::get_document_session, document_session::join_document_session,
+            document_session::leave_document_session,
+            document_session::publish_document_session, document_session::acquire_document_session,
+            document_session::release_document_session, document_session::update_document_source_fingerprint,
+            document_session::reset_document_session, document_session::confirm_document_handoff])
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_keyring_store::init())
