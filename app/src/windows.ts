@@ -74,6 +74,12 @@ export async function showLibrary(): Promise<void> {
   if (main) { await main.show(); await main.setFocus(); }
 }
 
+export async function showYandexLibrary(): Promise<void> {
+  sessionStorage.setItem("docx-vim-open-yandex", "1");
+  await showLibrary();
+  if (isTauri()) await emitTo("main", "show-yandex-files");
+}
+
 export async function registerDocumentTask(id: string, name: string): Promise<void> {
   if (isTauri() && /Android/i.test(navigator.userAgent)) await invoke("register_task", { id, name });
 }

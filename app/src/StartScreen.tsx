@@ -3,6 +3,7 @@ import { generateJSON } from "@tiptap/core";
 import { isTauri } from "@tauri-apps/api/core";
 import { basename } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -21,6 +22,13 @@ export default function StartScreen() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [recent, setRecent] = useState<RecentDocument[]>([]);
   const [yandexFiles, setYandexFiles] = useState<RemoteFile[]>([]);
+  const [yandexLoading, setYandexLoading] = useState(false);
+  const [yandexError, setYandexError] = useState(false);
+  const [showYandexFiles, setShowYandexFiles] = useState(() => {
+    const requested = sessionStorage.getItem("docx-vim-open-yandex") === "1";
+    sessionStorage.removeItem("docx-vim-open-yandex");
+    return requested;
+  });
   const [showDrafts, setShowDrafts] = useState(false);
   const [fileNotice, setFileNotice] = useState("");
   const [openIds, setOpenIds] = useState<string[]>([]);
@@ -41,8 +49,11 @@ export default function StartScreen() {
     setDrafts(savedDrafts); setRecent(savedRecent); setOpenIds(windows);
   }, []);
   const refreshYandex = useCallback(async () => {
+    setYandexLoading(true);
+    setYandexError(false);
     try { setYandexFiles(await listYandexDocx()); }
-    catch { setYandexFiles([]); setFileNotice("Список Яндекс Диска пока недоступен"); }
+    catch { setYandexFiles([]); setYandexError(true); }
+    finally { setYandexLoading(false); }
   }, []);
   useEffect(() => {
     void refresh();
@@ -67,6 +78,11 @@ export default function StartScreen() {
     return () => removeEventListener("focus", onFocus);
   }, [cloudConnected.yandexDisk, refreshYandex]);
   useEffect(() => () => authAbort.current?.abort(), []);
+  useEffect(() => {
+    if (!isTauri()) return;
+    const listener = listen("show-yandex-files", () => { setShowSettings(false); setShowYandexFiles(true); void refreshYandex(); });
+    return () => { void listener.then((unlisten) => unlisten()); };
+  }, [refreshYandex]);
   useEffect(() => {
     if (!isTauri() || /Android/i.test(navigator.userAgent)) return;
     const main = getCurrentWindow();
@@ -218,7 +234,6 @@ export default function StartScreen() {
     }
   }
   recentFiles.sort((a, b) => b.openedAt.localeCompare(a.openedAt));
-  const otherYandexFiles = yandexFiles.filter((file) => !knownPaths.has(file.path));
 
   return <main className="start-screen">
     <header className="start-header">
@@ -229,6 +244,7 @@ export default function StartScreen() {
       <div className="start-actions">
         <button type="button" onClick={newDocument} disabled={busy}>Новый документ</button>
         <button type="button" onClick={openFile} disabled={busy}>Открыть DOCX</button>
+        <button type="button" onClick={() => { setShowSettings(false); setShowYandexFiles((value) => !value); if (cloudConnected.yandexDisk) void refreshYandex(); }} aria-expanded={showYandexFiles}>Яндекс Диск</button>
         <button type="button" onClick={() => setShowDrafts((value) => !value)} aria-expanded={showDrafts}>Черновики ({drafts.length})</button>
         <input ref={fileInput} type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden
           onChange={async (event) => {
@@ -315,6 +331,13 @@ export default function StartScreen() {
           <ul>{personal[settings.language].map((word) => <li key={word}>{word} <button type="button" onClick={() => changeDictionary(settings.language, personal[settings.language].filter((item) => item !== word))}>Удалить</button></li>)}</ul>
         </div>
       </section>}
+      {showYandexFiles && <section className="start-panel"><div className="section-heading"><h2>Яндекс Диск · DOCX</h2>{cloudConnected.yandexDisk && <button type="button" onClick={() => void refreshYandex()} disabled={busy}>Обновить</button>}</div>
+        {!cloudConnected.yandexDisk ? <p className="empty-list">Подключите Яндекс Диск в настройках стартового окна.</p> : yandexLoading ? <p className="empty-list">Загружаем список DOCX…</p> : yandexError ? <p className="empty-list">Список недоступен. Нажмите «Обновить».</p> : yandexFiles.length ? <ul className="document-list">{yandexFiles.map((file) => <li key={file.path}>
+          <button type="button" disabled={busy} onClick={() => void openRecent({ id: "", name: file.name, sourcePath: file.path, openedAt: file.modified ?? "" })}>
+            <strong>{file.name}</strong><span>Яндекс Диск · {decodeURIComponent(file.path.slice("remote:yandexDisk:".length))} · {file.modified ? new Date(file.modified).toLocaleString("ru-RU") : "DOCX"}</span>
+          </button>
+        </li>)}</ul> : <p className="empty-list">Файлов DOCX не найдено</p>}
+      </section>}
       <section className="start-panel"><h2>Недавние файлы</h2>
         {recentFiles.length ? <ul className="document-list">{recentFiles.map((item) => <li key={item.sourcePath}>
           <button type="button" onClick={() => void openRecent(item)} disabled={busy}>
@@ -322,13 +345,6 @@ export default function StartScreen() {
           </button>
         </li>)}</ul> : <p className="empty-list">Открытые файлы появятся здесь</p>}
       </section>
-      {cloudConnected.yandexDisk && <section className="start-panel"><div className="section-heading"><h2>Яндекс Диск</h2><button type="button" onClick={() => void refreshYandex()} disabled={busy}>Обновить</button></div>
-        {otherYandexFiles.length ? <ul className="document-list">{otherYandexFiles.map((file) => <li key={file.path}>
-          <button type="button" disabled={busy} onClick={() => void openRecent({ id: "", name: file.name, sourcePath: file.path, openedAt: file.modified ?? "" })}>
-            <strong>{file.name}</strong><span>Яндекс Диск · {file.modified ? new Date(file.modified).toLocaleString("ru-RU") : "DOCX"}</span>
-          </button>
-        </li>)}</ul> : <p className="empty-list">Других файлов DOCX не найдено</p>}
-      </section>}
       {showDrafts && <section className="start-panel"><h2>Черновики</h2><p className="draft-location">Резервные копии во внутреннем каталоге приложения: AppData/drafts. Открытие копии не меняет исходный файл.</p>
         {drafts.length ? <ul className="document-list">{drafts.map((draft) => <li key={draft.id}>
           <button type="button" disabled={busy} onClick={() => void openBackup(draft).catch(() => setFileNotice("Не удалось открыть черновик"))}>

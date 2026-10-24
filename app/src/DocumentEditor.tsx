@@ -12,9 +12,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { BaseDirectory, readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { exportDocx } from "./docx";
 import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
-import { CloudSync, cloudName, cloudProviders, type CloudProvider, type CloudStates } from "./cloud-sync";
-import { isConnected } from "./cloud-auth";
-import { isRemoteTarget, remoteTarget } from "./cloud-remote";
+import { CloudSync, cloudProviders, type CloudProvider, type CloudStates } from "./cloud-sync";
 import { readDraft, writeDraft, type Draft } from "./draft";
 import { rememberDocument } from "./library";
 import { editorExtensions } from "./editor-extensions";
@@ -26,7 +24,7 @@ import { checkGrammar } from "./grammar";
 import { VimMode as VimExtension, getVimMode } from "vim-prosemirror/tiptap";
 import "vim-prosemirror/style.css";
 import { VimAdapter, type VimMode } from "./vim-adapter";
-import { focusAdjacentWindow, isDocumentSaveOwner, openDocumentWindow, openWindowIds, registerDocumentTask, showLibrary } from "./windows";
+import { focusAdjacentWindow, isDocumentSaveOwner, openDocumentWindow, openWindowIds, registerDocumentTask, showLibrary, showYandexLibrary } from "./windows";
 import "./App.css";
 
 type ViewMode = "page" | "mobile";
@@ -58,7 +56,6 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [saveStatus, setSaveStatus] = useState("Подготовка…");
   const [busy, setBusy] = useState(false);
   const [cloudStates, setCloudStates] = useState<CloudStates>({});
-  const [showClouds, setShowClouds] = useState(false);
   const [vimEnabled, setVimEnabled] = useState(true);
   const [hideMenu, setHideMenu] = useState(false);
   const [assistSettings, setAssistSettings] = useState<Settings>(defaultSettings);
@@ -645,49 +642,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     finally { setBusy(false); }
   };
 
-  const bindCloud = async (provider: CloudProvider): Promise<void> => {
-    if (!editor || !ready || busy || !isTauri()) return;
-    setBusy(true);
-    try {
-      let selected: string | null;
-      if (/Android/i.test(navigator.userAgent)) {
-        const settings = await readSettings();
-        const clientId = provider === "oneDrive" ? settings.oneDriveClientId : settings.yandexClientId;
-        if (!(await isConnected(provider, clientId))) {
-          setSaveStatus(`${cloudName[provider]}: подключите аккаунт в настройках стартового окна`);
-          return;
-        }
-        selected = remoteTarget(provider, documentId, documentName);
-      } else {
-        const name = `${documentName.replace(/\.docx$/i, "")}.docx`;
-        selected = await save({ defaultPath: name, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
-      }
-      if (!selected) return;
-      currentCloudTargets.current = { ...currentCloudTargets.current, [provider]: selected };
-      if (await isDocumentSaveOwner(documentId)) cloudSync.current?.rebind(provider, selected);
-      else documentChannel.current?.postMessage({ type: "cloud-rebind", provider, path: selected });
-      await persistCurrent(true);
-      setSaveStatus(`${cloudName[provider]}: облачная копия подключена`);
-    } catch { setSaveStatus(""); }
-    finally { setBusy(false); }
-  };
-
-  const unbindCloud = async (provider: CloudProvider): Promise<void> => {
-    const targets = { ...currentCloudTargets.current };
-    delete targets[provider];
-    currentCloudTargets.current = targets;
-    if (await isDocumentSaveOwner(documentId)) cloudSync.current?.disconnect(provider);
-    else documentChannel.current?.postMessage({ type: "cloud-disconnect", provider });
-    try { await persistCurrent(true); } catch { /* The draft remains available. */ }
-  };
-
   const exportConflict = async (provider: CloudProvider): Promise<void> => {
     const copy = cloudStates[provider]?.conflictCopy;
     if (!copy) return;
     const destination = await save({ defaultPath: `${documentName.replace(/\.docx$/i, "")}-${provider}-конфликт.docx`, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
     if (!destination) return;
     try { await writeFile(destination, await readFile(copy, { baseDir: BaseDirectory.AppData })); }
-    catch { /* Local conflict copy remains available for another attempt. */ }
+    catch { /* Recovery copy remains in AppData/cloud-conflicts. */ }
   };
 
   const quitDocument = async (): Promise<void> => {
@@ -813,7 +774,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         </div>
         <div className="file-actions" role="group" aria-label="Файл">
           <button type="button" onClick={() => void showLibrary()}>Документы</button>
+          <button type="button" onClick={() => void showYandexLibrary()}>Яндекс Диск</button>
           <button type="button" onClick={saveDocument} disabled={!editor || busy || !ready}>Сохранить DOCX</button>
+          {cloudProviders.filter((provider) => cloudStates[provider]?.status === "conflict").map((provider) =>
+            <button key={provider} type="button" onClick={() => void exportConflict(provider)}>Сохранить конфликтную копию {provider === "yandexDisk" ? "Яндекса" : "OneDrive"}</button>)}
         </div>
         <div className="view-switch" role="group" aria-label="Вид документа">
           <button type="button" aria-pressed={viewMode === "page"} onClick={() => { currentViewMode.current = "page"; setViewMode("page"); }}>
@@ -897,25 +861,6 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           onClick={() => applyCorrectionChoice(index)}>{choice}</button>)}
       </div>}
 
-      {showClouds && <section className="cloud-panel" aria-label="Облачные копии документа">
-        <strong>Облачные копии</strong>
-        <p>{/Android/i.test(navigator.userAgent) ? "Подключите аккаунты в настройках стартового окна. Здесь включите нужные облачные копии." : "Выберите файл в синхронизируемой папке нужного сервиса. Каждая копия сохраняется отдельно."}</p>
-        {cloudProviders.map((provider) => {
-          const path = currentCloudTargets.current?.[provider];
-          const state = cloudStates[provider];
-          const status = state?.status === "saved" ? (path && isRemoteTarget(path) ? "Сохранено в облаке" : "Файл передан провайдеру") : state?.status === "writing" ? "Запись…"
-            : state?.status === "retry" ? "Ожидает повторной записи" : state?.status === "conflict" ? "Внешнее изменение: локальная копия сохранена"
-              : path ? "Ожидает записи" : "Не подключён";
-          return <div className="cloud-row" key={provider}>
-            <div><strong>{cloudName[provider]}</strong><small>{status}</small>{path && <small title={path}>{isRemoteTarget(path) ? decodeURIComponent(path.slice(path.lastIndexOf(":") + 1)) : path}</small>}</div>
-            <button type="button" disabled={busy || !!(path && isRemoteTarget(path))} onClick={() => void bindCloud(provider)}>{path && isRemoteTarget(path) ? "Подключено" : /Android/i.test(navigator.userAgent) ? "Подключить копию" : path ? "Сменить файл" : "Выбрать файл"}</button>
-            {state?.status === "conflict" && <button type="button" onClick={() => void exportConflict(provider)}>Сохранить копию</button>}
-            {path && <button type="button" disabled={busy} onClick={() => void unbindCloud(provider)}>Отключить</button>}
-          </div>;
-        })}
-        <button type="button" onClick={() => { cloudSync.current?.retry(); setShowClouds(false); }}>Повторить и закрыть</button>
-      </section>}
-
       <footer className="status-bar">
         <span>{vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
         {completion && <span className="completion-hint">{completion.suggestion} · Tab / Ctrl+Space</span>}
@@ -952,8 +897,12 @@ function DocumentEditor({ documentId }: { documentId: string }) {
               }
             }} />
         </label>}
-        {hideMenu && <button type="button" onClick={() => setShowHeadings((value) => !value)}>Заголовки</button>}
-        <button type="button" onClick={() => setShowClouds((value) => !value)}>Облака{cloudProviders.some((provider) => currentCloudTargets.current?.[provider]) ? " ✓" : ""}</button>
+        {hideMenu && <><button type="button" onClick={() => setShowHeadings((value) => !value)}>Заголовки</button><button type="button" onClick={() => void showYandexLibrary()}>Яндекс Диск</button></>}
+        <span className="source-indicator" aria-label={sourceLabel === "Яндекс Диск" ? "Файл в облаке" : "Файл не в облаке"}>
+          {sourceLabel === "Яндекс Диск" ? "✓ Облако" : `✕ ${sourceLabel}`}
+          {sourceLabel === "Яндекс Диск" && cloudStates.yandexDisk?.status === "retry" ? " · ожидает синхронизации" : ""}
+          {sourceLabel === "Яндекс Диск" && cloudStates.yandexDisk?.status === "conflict" ? " · конфликт версии" : ""}
+        </span>
         <span>{saveStatus}</span>
       </footer>
     </main>
