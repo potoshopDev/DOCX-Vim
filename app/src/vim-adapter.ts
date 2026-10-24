@@ -31,6 +31,7 @@ function withKey(event: KeyboardEvent, key: string): void {
 
 export class VimAdapter {
   private windowPending = false;
+  private issuePending: 1 | -1 | 0 = 0;
   private registerPrefix: "quote" | "plus" | null = null;
   private plusYank: { origin: number; count: number } | null = null;
   private backwardSearch = false;
@@ -40,7 +41,8 @@ export class VimAdapter {
   private lastWordAction: { operator: "d" | "c"; object: "w" | "W"; around: boolean } | null = null;
   enabled = true;
   constructor(private editor: Editor, private windowCommand: (key: string) => void,
-    private commandInput: () => void, private searchInput: (backward: boolean) => void) {}
+    private commandInput: () => void, private searchInput: (backward: boolean) => void,
+    private jumpIssue: (direction: 1 | -1) => void) {}
 
   mode(): VimMode {
     return (vimPluginKey.getState(this.editor.state)?.mode ?? "normal") as VimMode;
@@ -49,6 +51,7 @@ export class VimAdapter {
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
     this.windowPending = false;
+    this.issuePending = 0;
     this.registerPrefix = null;
     this.plusYank = null;
     const state = vimPluginKey.getState(this.editor.state);
@@ -260,17 +263,38 @@ export class VimAdapter {
       if (event.key === "Escape") { event.preventDefault(); return true; }
       return false;
     }
-    if (event.isComposing || state.searchActive || state.mode === "insert" || state.mode === "replace") return false;
+    if (event.isComposing || state.searchActive || state.mode === "insert" || state.mode === "replace") {
+      this.issuePending = 0;
+      return false;
+    }
+    if (state.mode !== "normal") this.issuePending = 0;
     if (event.ctrlKey && !event.altKey && (event.code === "KeyW" || /[wц]/i.test(event.key))) {
+      this.issuePending = 0;
       this.windowPending = true; event.preventDefault(); return true;
     }
-    if (event.ctrlKey || event.altKey || event.metaKey) return false;
+    if (event.ctrlKey || event.altKey || event.metaKey) { this.issuePending = 0; return false; }
     const key = commandKey(event);
     if (this.windowPending) {
       this.windowPending = false;
       event.preventDefault();
       this.windowCommand(key);
       return true;
+    }
+    if (state.mode === "normal") {
+      if (this.issuePending) {
+        const direction = this.issuePending;
+        this.issuePending = 0;
+        if (key === "g") {
+          event.preventDefault();
+          this.jumpIssue(direction);
+          return true;
+        }
+      }
+      if (key === "[" || key === "]") {
+        this.issuePending = key === "]" ? 1 : -1;
+        event.preventDefault();
+        return true;
+      }
     }
     if (this.plusYank) {
       if (event.key === "Escape") {

@@ -67,6 +67,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const pendingCorrectionOffset = useRef(0);
   const ignoredIssues = useRef(new Set<string>());
   const completionRef = useRef<typeof completion>(null);
+  const correctionPanel = useRef<HTMLDivElement>(null);
   const assistSettingsRef = useRef(assistSettings);
   const personalRef = useRef(personal);
   const checkWorker = useRef<Worker | null>(null);
@@ -107,34 +108,52 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     selection: editor ? { anchor: editor.state.selection.anchor, head: editor.state.selection.head } : undefined,
     scrollTop: editorArea.current?.scrollTop,
   });
+  const correctionChoiceCount = (issue: TextIssue) => issue.suggestions.length + (issue.kind === "spelling" ? 3 : 2);
+  const applyCorrectionChoice = (index: number): boolean => {
+    const issue = selectedIssueRef.current;
+    if (!issue || !editor) return false;
+    const suggestionCount = issue.suggestions.length;
+    if (index < 0 || index >= correctionChoiceCount(issue)) return false;
+    if (index < suggestionCount) {
+      if (editor.state.doc.textBetween(issue.from, issue.to) !== issue.word) return false;
+      editor.chain().focus().insertContentAt({ from: issue.from, to: issue.to }, issue.suggestions[index]).run();
+    } else if (issue.kind === "spelling" && index === suggestionCount) {
+      const language: Language = /[А-Яа-яЁё]/.test(issue.word) ? "ru" : "en";
+      const word = issue.word.toLocaleLowerCase(language);
+      const next = { ...personalRef.current, [language]: [...new Set([...personalRef.current[language], word])].sort() };
+      personalRef.current = next;
+      setPersonal(next);
+      void writePersonalDictionary(next).catch(() => {});
+    } else if (index === correctionChoiceCount(issue) - 2) {
+      ignoredIssues.current.add(`${issue.kind}:${issue.word}`);
+      const next = issuesRef.current.filter((item) => !ignoredIssues.current.has(`${item.kind}:${item.word}`));
+      issuesRef.current = next;
+      editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, next).setMeta("addToHistory", false));
+    }
+    correctionRequest.current++;
+    correctionPendingRef.current = false;
+    selectedIssueRef.current = null;
+    setSelectedIssue(null);
+    setCorrectionPending(false);
+    editor.commands.focus();
+    return true;
+  };
   const cycleCorrection = (direction: 1 | -1): boolean => {
     const issue = selectedIssueRef.current;
     if (issue && correctionPendingRef.current) {
       pendingCorrectionOffset.current += direction;
       return true;
     }
-    if (!issue?.suggestions.length) return false;
-    const next = (correctionIndexRef.current + direction + issue.suggestions.length) % issue.suggestions.length;
+    if (!issue) return false;
+    const count = correctionChoiceCount(issue);
+    const next = (correctionIndexRef.current + direction + count) % count;
     correctionIndexRef.current = next;
     flushSync(() => setCorrectionIndex(next));
     return true;
   };
   const acceptCorrection = (): boolean => {
     const issue = selectedIssueRef.current;
-    if (!editor || !issue?.suggestions.length) return false;
-    if (editor.state.doc.textBetween(issue.from, issue.to) !== issue.word) {
-      selectedIssueRef.current = null;
-      setSelectedIssue(null);
-      return false;
-    }
-    const replacement = issue.suggestions[correctionIndexRef.current];
-    editor.chain().focus().insertContentAt({ from: issue.from, to: issue.to }, replacement).run();
-    correctionRequest.current++;
-    correctionPendingRef.current = false;
-    selectedIssueRef.current = null;
-    setSelectedIssue(null);
-    setCorrectionPending(false);
-    return true;
+    return issue ? applyCorrectionChoice(correctionIndexRef.current) : false;
   };
   const showCorrectionsAtCaret = (direction: 1 | -1) => {
     if (!editor) return;
@@ -195,10 +214,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           return true;
         }
         const correction = selectedIssueRef.current;
-        if (event.key === "Tab" && correction?.suggestions.length) {
+        if (event.key === "Tab" && correction) {
           event.preventDefault();
           event.stopPropagation();
-          acceptCorrection();
+          if (!correctionPendingRef.current) acceptCorrection();
           return true;
         }
         if (event.key === "Tab" && (!editable || !completionRef.current)) {
@@ -297,32 +316,11 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     },
   });
   useEffect(() => {
-    if (!selectedIssue || !editor) return;
-    const onCorrectionKeyDown = (event: KeyboardEvent) => {
-      const target = event.target;
-      if (target instanceof HTMLElement && target !== editor.view.dom &&
-        !editor.view.dom.contains(target) && target.closest("input, textarea, [contenteditable='true']")) return;
-      const direction = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
-        ? event.code === "KeyN" || ["n", "N", "т", "Т"].includes(event.key) ? 1
-          : event.code === "KeyP" || ["p", "P", "з", "З"].includes(event.key) ? -1 : 0
-        : 0;
-      if (direction) {
-        if (!cycleCorrection(direction as 1 | -1)) return;
-      } else if (event.key === "Tab") {
-        if (!correctionPendingRef.current && !acceptCorrection()) return;
-      } else if (event.key === "Escape") {
-        correctionRequest.current++;
-        correctionPendingRef.current = false;
-        selectedIssueRef.current = null;
-        setSelectedIssue(null);
-        setCorrectionPending(false);
-      } else return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-    };
-    window.addEventListener("keydown", onCorrectionKeyDown, true);
-    return () => window.removeEventListener("keydown", onCorrectionKeyDown, true);
-  }, [editor, selectedIssue]);
+    if (!selectedIssue) return;
+    correctionPanel.current?.focus({ preventScroll: true });
+    correctionPanel.current?.querySelector<HTMLButtonElement>(".correction-choice--active")
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [selectedIssue, correctionIndex]);
   useEffect(() => {
     const worker = new Worker(new URL("./text-check.worker.ts", import.meta.url), { type: "module" });
     checkWorker.current = worker;
@@ -430,7 +428,19 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       if (["s", "v"].includes(key)) void persistCurrent(true).then(() => openDocumentWindow(documentId, documentName, true)).catch(() => {});
       else if (["w", "W", "p", "h", "j", "k", "l"].includes(key)) void focusAdjacentWindow(key === "W" || key === "p" || key === "h" || key === "k" ? -1 : 1);
     }, () => { setCommandLine(""); requestAnimationFrame(() => commandInput.current?.focus()); },
-    (backward) => { setSearchLine({ backward, query: "" }); requestAnimationFrame(() => searchInput.current?.focus()); });
+    (backward) => { setSearchLine({ backward, query: "" }); requestAnimationFrame(() => searchInput.current?.focus()); },
+    (direction) => {
+      const issues = issuesRef.current
+        .filter((issue) => issue.from >= 1 && issue.to <= editor.state.doc.content.size &&
+          editor.state.doc.textBetween(issue.from, issue.to) === issue.word)
+        .sort((left, right) => left.from - right.from);
+      if (!issues.length) return;
+      const position = editor.state.selection.from;
+      const target = direction === 1
+        ? issues.find((issue) => issue.from > position) ?? issues[0]
+        : [...issues].reverse().find((issue) => issue.from < position) ?? issues[issues.length - 1];
+      editor.chain().focus().setTextSelection(target.from).scrollIntoView().run();
+    });
     vim.current.setEnabled(vimEnabled);
     setVimMode(vim.current.mode());
     return () => { vim.current = null; };
@@ -673,6 +683,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       return items;
     },
   }) ?? [];
+  const correctionChoices = selectedIssue
+    ? [...selectedIssue.suggestions, ...(selectedIssue.kind === "spelling" ? ["Добавить в словарь"] : []), "Игнорировать", "Закрыть"]
+    : [];
 
   const setLink = () => {
     if (!editor) return;
@@ -684,30 +697,6 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     } else {
       editor.chain().focus().unsetLink().run();
     }
-  };
-  const replaceIssue = (replacement: string) => {
-    if (!editor || !selectedIssue) return;
-    editor.chain().focus().insertContentAt({ from: selectedIssue.from, to: selectedIssue.to }, replacement).run();
-    setSelectedIssue(null);
-  };
-  const addIssueWord = () => {
-    if (!selectedIssue) return;
-    const language: Language = /[А-Яа-яЁё]/.test(selectedIssue.word) ? "ru" : "en";
-    const word = selectedIssue.word.toLocaleLowerCase(language);
-    const next = { ...personalRef.current, [language]: [...new Set([...personalRef.current[language], word])].sort() };
-    setPersonal(next);
-    void writePersonalDictionary(next).catch(() => {});
-    setSelectedIssue(null);
-    editor?.commands.focus();
-  };
-  const ignoreIssue = () => {
-    if (!selectedIssue || !editor) return;
-    ignoredIssues.current.add(`${selectedIssue.kind}:${selectedIssue.word}`);
-    const next = issuesRef.current.filter((issue) => !ignoredIssues.current.has(`${issue.kind}:${issue.word}`));
-    issuesRef.current = next;
-    editor.view.dispatch(editor.state.tr.setMeta(textCheckKey, next).setMeta("addToHistory", false));
-    setSelectedIssue(null);
-    editor.commands.focus();
   };
 
   const formatButton = (label: string, title: string, selected: boolean, action: () => void) => (
@@ -788,17 +777,31 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         <EditorContent editor={editor} className="document" />
       </section>
 
-      {selectedIssue && <div className="correction-panel" role="group" aria-label="Исправление текста">
+      {selectedIssue && <div ref={correctionPanel} className="correction-panel" role="group" tabIndex={-1}
+        aria-label="Исправление текста"
+        onKeyDown={(event) => {
+          const direction = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
+            ? event.code === "KeyN" || ["n", "N", "т", "Т"].includes(event.key) ? 1
+              : event.code === "KeyP" || ["p", "P", "з", "З"].includes(event.key) ? -1 : 0
+            : 0;
+          if (direction) {
+            event.preventDefault(); event.stopPropagation();
+            cycleCorrection(direction as 1 | -1);
+          } else if (event.key === "Tab") {
+            event.preventDefault(); event.stopPropagation();
+            if (!correctionPendingRef.current) acceptCorrection();
+          } else if (event.key === "Escape") {
+            event.preventDefault(); event.stopPropagation();
+            applyCorrectionChoice(correctionChoices.length - 1);
+          }
+        }}>
         <span>{selectedIssue.message || `Слово «${selectedIssue.word}» не найдено в словаре`}</span>
         {correctionPending && <span>Подбираем варианты…</span>}
         {!correctionPending && !selectedIssue.suggestions.length && <span>Вариантов нет</span>}
-        {selectedIssue.suggestions.length > 0 && <span>Вариант {correctionIndex + 1}/{selectedIssue.suggestions.length} · Ctrl+N/P — выбор · Tab — вставить</span>}
-        {selectedIssue.suggestions.map((word, index) => <button type="button" key={`${word}-${index}`}
+        <span>Выбрано: {correctionChoices[correctionIndex]} · Ctrl+N/P — выбор · Tab — выполнить</span>
+        {correctionChoices.map((choice, index) => <button type="button" key={`${choice}-${index}`}
           className={index === correctionIndex ? "correction-choice--active" : ""} aria-pressed={index === correctionIndex}
-          onClick={() => replaceIssue(word)}>{word}</button>)}
-        {selectedIssue.kind === "spelling" && <button type="button" onClick={addIssueWord}>Добавить в словарь</button>}
-        <button type="button" onClick={ignoreIssue}>Игнорировать</button>
-        <button type="button" onClick={() => setSelectedIssue(null)}>Закрыть</button>
+          onClick={() => applyCorrectionChoice(index)}>{choice}</button>)}
       </div>}
 
       <footer className="status-bar">
