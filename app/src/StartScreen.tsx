@@ -5,18 +5,20 @@ import { basename } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { readFile } from "@tauri-apps/plugin-fs";
+import { readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { importDocx } from "./docx";
+import { exportInWorker } from "./background-save";
 import { editorExtensions } from "./editor-extensions";
-import { listDrafts, writeDraft, type Draft } from "./draft";
+import { listDrafts, readDraft, writeDraft, type Draft } from "./draft";
 import { listRecent, rememberDocument, type RecentDocument } from "./library";
 import { defaultSettings, readSettings, writeSettings, type Settings } from "./settings";
 import { readPersonalDictionary, writePersonalDictionary, type Language, type PersonalDictionary } from "./personal-dictionary";
 import { openDocumentWindow, openWindowIds } from "./windows";
 import { beginYandex, completeOneDrive, completeYandex, disconnect, isConnected, requestOneDriveCode, type DeviceCode } from "./cloud-auth";
 import { rememberOpenedRemote, type CloudProvider } from "./cloud-sync";
-import { downloadYandexDocx, isRemoteTarget, listYandexDocx, type RemoteFile } from "./cloud-remote";
+import { downloadYandexDocx, isRemoteTarget, listYandexDocx, uploadRemote, type RemoteFile } from "./cloud-remote";
+import { fingerprint, replaceSourceDraft } from "./source-version";
 
 export default function StartScreen() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -103,10 +105,12 @@ export default function StartScreen() {
     const draft: Draft = {
       version: 1, id, name, document: generateJSON(imported.html || "<p></p>", editorExtensions),
       updatedAt: new Date().toISOString(), sourcePath,
+      sourceFingerprint: sourcePath && !isRemoteTarget(sourcePath) ? await fingerprint(bytes) : undefined,
       savePath: sourcePath && !isRemoteTarget(sourcePath) ? sourcePath : undefined,
       cloudTargets: sourcePath?.startsWith("remote:yandexDisk:") ? { yandexDisk: sourcePath } : {},
     };
-    await writeDraft(draft);
+    if (sourcePath) await replaceSourceDraft(draft);
+    else await writeDraft(draft);
     if (sourcePath?.startsWith("remote:yandexDisk:") && revision)
       await rememberOpenedRemote(id, "yandexDisk", sourcePath, revision);
     await showDocument(draft);
@@ -116,7 +120,7 @@ export default function StartScreen() {
     const existing = recent.find((item) => item.sourcePath === path);
     const previous = drafts.find((draft) => draft.sourcePath === path);
     const id = existing?.id ?? previous?.id ?? crypto.randomUUID();
-    if (openIds.includes(id)) { await openDocumentWindow(id, name ?? existing?.name ?? previous?.name ?? "Документ"); return; }
+    if ((await openWindowIds()).includes(id)) { await openDocumentWindow(id, name ?? existing?.name ?? previous?.name ?? "Документ"); return; }
     const bytes = await readFile(path);
     const resolvedName = name ?? await basename(path).catch(() => path.split(/[\\/]/).pop() || "Документ.docx");
     await importBytes(bytes, resolvedName, path, id);
@@ -126,16 +130,62 @@ export default function StartScreen() {
     const existing = recent.find((item) => item.sourcePath === path);
     const previous = drafts.find((draft) => draft.sourcePath === path);
     const id = existing?.id ?? previous?.id ?? crypto.randomUUID();
-    if (openIds.includes(id)) { await openDocumentWindow(id, name); return; }
+    if ((await openWindowIds()).includes(id)) { await openDocumentWindow(id, name); return; }
     const { bytes, revision } = await downloadYandexDocx(path);
     await importBytes(bytes, name, path, id, revision);
   };
 
   const openBackup = async (draft: Draft) => {
     const backed = !!(draft.sourcePath || draft.savePath || Object.values(draft.cloudTargets ?? {}).some(Boolean));
-    const backup = backed ? { ...draft, id: crypto.randomUUID(), sourcePath: undefined, savePath: undefined, cloudTargets: {}, updatedAt: new Date().toISOString() } : draft;
+    const backup = backed ? { ...draft, id: crypto.randomUUID(), restoreSourcePath: draft.sourcePath ?? draft.restoreSourcePath,
+      sourcePath: undefined, sourceFingerprint: undefined, savePath: undefined, cloudTargets: {}, updatedAt: new Date().toISOString() } : draft;
     if (backup !== draft) await writeDraft(backup);
     await showDocument(backup);
+  };
+
+  const restoreBackup = async (backup: Draft) => {
+    const source = backup.restoreSourcePath;
+    if (!source || busy || !isTauri()) return;
+    setBusy(true);
+    try {
+      if ((await openWindowIds()).includes(backup.id)) { setFileNotice("Закройте окно черновика перед восстановлением версии"); return; }
+      const savedBackup = await readDraft(backup.id);
+      if (!savedBackup?.restoreSourcePath || savedBackup.restoreSourcePath !== source) return;
+      const existing = recent.find((item) => item.sourcePath === source);
+      const previous = drafts.find((item) => item.sourcePath === source);
+      const id = existing?.id ?? previous?.id ?? crypto.randomUUID();
+      if ((await openWindowIds()).includes(id)) { setFileNotice("Закройте исходный документ перед восстановлением версии"); return; }
+      const remote = source.startsWith("remote:yandexDisk:");
+      const current = remote ? await downloadYandexDocx(source) : { bytes: await readFile(source), revision: undefined };
+      const imported = await importDocx(current.bytes);
+      const name = existing?.name ?? previous?.name ?? (remote
+        ? decodeURIComponent(source.slice("remote:yandexDisk:".length)).split("/").pop()
+        : source.split(/[\\/]/).pop()) ?? "Документ.docx";
+      await writeDraft({
+        version: 1, id: crypto.randomUUID(), name: `${name.replace(/\.docx$/i, "")} — версия перед восстановлением`,
+        document: generateJSON(imported.html || "<p></p>", editorExtensions), updatedAt: new Date().toISOString(),
+        restoreSourcePath: source,
+      });
+      const bytes = await exportInWorker(savedBackup.document);
+      let revision: string | undefined;
+      if (remote) revision = await uploadRemote("yandexDisk", source, bytes, current.revision);
+      else {
+        if (await fingerprint(await readFile(source)) !== await fingerprint(current.bytes)) throw new Error("Source changed during restore");
+        await writeFile(source, bytes);
+      }
+      await writeDraft({
+        version: 1, id, name, document: savedBackup.document, updatedAt: new Date().toISOString(), sourcePath: source,
+        sourceFingerprint: remote ? undefined : await fingerprint(bytes),
+        savePath: remote ? undefined : source,
+        cloudTargets: remote ? { yandexDisk: source } : {},
+      });
+      if (remote && revision) await rememberOpenedRemote(id, "yandexDisk", source, revision);
+      await rememberDocument({ id, name, sourcePath: source });
+      await openDocumentWindow(id, name);
+      await refresh();
+      if (remote) void refreshYandex();
+    } catch { setFileNotice("Проверьте исходный файл и сохранённые версии в черновиках."); }
+    finally { setBusy(false); }
   };
 
   const openFile = async () => {
@@ -225,14 +275,6 @@ export default function StartScreen() {
   };
 
   const recentFiles = recent.filter((item) => item.sourcePath && (!isRemoteTarget(item.sourcePath) || item.sourcePath.startsWith("remote:yandexDisk:")));
-  const knownPaths = new Set(recentFiles.map((item) => item.sourcePath));
-  for (const draft of drafts) {
-    const path = draft.cloudTargets?.yandexDisk;
-    if (path && !knownPaths.has(path)) {
-      recentFiles.push({ id: draft.sourcePath === path ? draft.id : "", name: draft.name, sourcePath: path, openedAt: draft.updatedAt });
-      knownPaths.add(path);
-    }
-  }
   recentFiles.sort((a, b) => b.openedAt.localeCompare(a.openedAt));
 
   return <main className="start-screen">
@@ -346,10 +388,11 @@ export default function StartScreen() {
         </li>)}</ul> : <p className="empty-list">Открытые файлы появятся здесь</p>}
       </section>
       {showDrafts && <section className="start-panel"><h2>Черновики</h2><p className="draft-location">Резервные копии во внутреннем каталоге приложения: AppData/drafts. Открытие копии не меняет исходный файл.</p>
-        {drafts.length ? <ul className="document-list">{drafts.map((draft) => <li key={draft.id}>
+        {drafts.length ? <ul className="document-list">{drafts.map((draft) => <li key={draft.id} className="draft-item">
           <button type="button" disabled={busy} onClick={() => void openBackup(draft).catch(() => setFileNotice("Не удалось открыть черновик"))}>
             <strong>{draft.name}</strong><span>Черновик · {new Date(draft.updatedAt).toLocaleString("ru-RU")}</span>
           </button>
+          {draft.restoreSourcePath && <button type="button" className="restore-button" disabled={busy || openIds.includes(draft.id)} onClick={() => void restoreBackup(draft)}>Восстановить исходный файл</button>}
         </li>)}</ul> : <p className="empty-list">Пока нет черновиков</p>}
       </section>}
     </div>

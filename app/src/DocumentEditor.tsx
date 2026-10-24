@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { EditorContent, useEditor, useEditorState } from "@tiptap/react";
+import { generateJSON } from "@tiptap/core";
 import type { EditorState } from "@tiptap/pm/state";
 import type { EditorProps } from "@tiptap/pm/view";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -10,12 +11,14 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { BaseDirectory, readFile, writeFile } from "@tauri-apps/plugin-fs";
-import { exportDocx } from "./docx";
+import { exportDocx, importDocx } from "./docx";
 import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
-import { CloudSync, cloudProviders, type CloudProvider, type CloudStates } from "./cloud-sync";
+import { CloudSync, cloudProviders, rememberOpenedRemote, type CloudProvider, type CloudStates } from "./cloud-sync";
+import { downloadYandexDocx } from "./cloud-remote";
 import { readDraft, writeDraft, type Draft } from "./draft";
 import { rememberDocument } from "./library";
 import { editorExtensions } from "./editor-extensions";
+import { fingerprint, preserveDraftVersion, replaceSourceDraft } from "./source-version";
 import { readSettings } from "./settings";
 import { defaultSettings, type Settings } from "./settings";
 import { readPersonalDictionary, writePersonalDictionary, type PersonalDictionary, type Language } from "./personal-dictionary";
@@ -53,6 +56,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [ready, setReady] = useState(false);
   const [revision, setRevision] = useState(0);
   const [contentRevision, setContentRevision] = useState(0);
+  const [localConflict, setLocalConflict] = useState(false);
   const [saveStatus, setSaveStatus] = useState("Подготовка…");
   const [busy, setBusy] = useState(false);
   const [cloudStates, setCloudStates] = useState<CloudStates>({});
@@ -99,20 +103,26 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const currentId = useRef(documentId);
   const currentName = useRef(documentName);
   const currentSourcePath = useRef<string | undefined>(undefined);
+  const currentRestoreSourcePath = useRef<string | undefined>(undefined);
+  const currentSourceFingerprint = useRef<string | undefined>(undefined);
   const currentSavePath = useRef<string | undefined>(undefined);
   const currentCloudTargets = useRef<Draft["cloudTargets"]>({});
   const currentViewMode = useRef<ViewMode>("mobile");
   const currentReady = useRef(false);
+  const conflictInProgress = useRef(false);
   const saver = useRef<BackgroundSaver | null>(null);
   const cloudSync = useRef<CloudSync | null>(null);
   if (!cloudSync.current) cloudSync.current = new CloudSync(documentId, setCloudStates);
   if (!saver.current) saver.current = new BackgroundSaver((_id, path) => {
     setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-  }, 800, (draft, bytes) => cloudSync.current?.schedule(draft, bytes));
+  }, 800, (draft, bytes) => cloudSync.current?.schedule(draft, bytes), () => setLocalConflict(true),
+  (revision) => { currentSourceFingerprint.current = revision; });
   const currentDraft = (): Draft => ({
     version: 1, id: currentId.current, name: currentName.current,
     document: editor!.getJSON(), updatedAt: new Date().toISOString(),
     sourcePath: currentSourcePath.current, savePath: currentSavePath.current,
+    restoreSourcePath: currentRestoreSourcePath.current,
+    sourceFingerprint: currentSourceFingerprint.current,
     cloudTargets: currentCloudTargets.current,
     viewMode: currentViewMode.current,
     selection: editor ? { anchor: editor.state.selection.anchor, head: editor.state.selection.head } : undefined,
@@ -350,10 +360,44 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     checkWorker.current?.postMessage({ ...message, id });
   });
   useEffect(() => {
+    if (!isTauri()) return;
+    const listener = listen("source-reload", () => location.reload());
+    return () => { void listener.then((unlisten) => unlisten()); };
+  }, []);
+  useEffect(() => {
     if (!editor) return;
     let cancelled = false;
-    Promise.all([readDraft(documentId), readSettings()]).then(async ([draft, settings]) => {
-      if (cancelled || !draft) return;
+    Promise.all([readDraft(documentId), readSettings()]).then(async ([storedDraft, settings]) => {
+      if (cancelled || !storedDraft) return;
+      let draft = storedDraft;
+      if (draft.sourcePath && await isDocumentSaveOwner(documentId)) {
+        try {
+          const source = draft.sourcePath;
+          const remote = source.startsWith("remote:yandexDisk:");
+          const { bytes, revision } = remote
+            ? await downloadYandexDocx(source)
+            : { bytes: await readFile(source), revision: undefined };
+          const imported = await importDocx(bytes);
+          if (cancelled) return;
+          draft = {
+            ...draft,
+            document: generateJSON(imported.html || "<p></p>", editorExtensions),
+            sourceFingerprint: remote ? undefined : await fingerprint(bytes),
+            savePath: remote ? undefined : source,
+            cloudTargets: remote ? { yandexDisk: source } : {},
+            updatedAt: new Date().toISOString(),
+          };
+          await replaceSourceDraft(draft);
+          if (remote && revision) await rememberOpenedRemote(documentId, "yandexDisk", source, revision);
+          if (isTauri()) for (const other of await WebviewWindow.getAll()) {
+            if (other.label !== getCurrentWindow().label && (other.label === `doc-${documentId}` || other.label.startsWith(`doc-${documentId}--`)))
+              void emitTo(other.label, "source-reload").catch(() => {});
+          }
+        } catch {
+          await showLibrary().catch(() => {});
+          return;
+        }
+      }
       await cloudSync.current?.load();
       if (cancelled) return;
       setVimEnabled(settings.vimEnabled);
@@ -361,12 +405,15 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       setAssistSettings(settings);
       saver.current = new BackgroundSaver((_id, path) => {
         setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-      }, settings.autosaveMs, (savedDraft, bytes) => cloudSync.current?.schedule(savedDraft, bytes));
+      }, settings.autosaveMs, (savedDraft, bytes) => cloudSync.current?.schedule(savedDraft, bytes),
+      () => setLocalConflict(true), (revision) => { currentSourceFingerprint.current = revision; });
       suppressUpdate.current = true;
       editor.chain().setMeta("addToHistory", false).setContent(draft.document, { emitUpdate: false }).run();
       suppressUpdate.current = false;
       currentName.current = draft.name;
       currentSourcePath.current = draft.sourcePath;
+      currentRestoreSourcePath.current = draft.restoreSourcePath;
+      currentSourceFingerprint.current = draft.sourceFingerprint;
       currentSavePath.current = draft.savePath;
       currentCloudTargets.current = draft.cloudTargets ?? {};
       setDocumentName(draft.name);
@@ -397,6 +444,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const android = isTauri() && /Android/i.test(navigator.userAgent);
     documentChannel.current = channel;
     channel.onmessage = (event: MessageEvent<{ type: string; document?: Draft["document"]; savePath?: string; cloudTargets?: Draft["cloudTargets"]; provider?: CloudProvider; path?: string }>) => {
+      if (event.data.type === "source-reload") { location.reload(); return; }
       if (event.data.type === "active") { if (!android) editor.setEditable(false); return; }
       if (event.data.type === "cloud-rebind" && event.data.provider && event.data.path) {
         void isDocumentSaveOwner(documentId).then((owner) => { if (owner) cloudSync.current?.rebind(event.data.provider!, event.data.path!); });
@@ -428,6 +476,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     };
     const onFocus = () => {
       if (!android && document.visibilityState === "hidden") return;
+      if (conflictInProgress.current) return;
       editor.setEditable(true);
       channel.postMessage({ type: "active" });
       setRevision((value) => value + 1);
@@ -480,12 +529,58 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     return () => removeEventListener("focus", refreshSettings);
   }, [editor]);
   useEffect(() => {
-    if (!editor || !ready || contentRevision === 0) return;
+    if (!editor || !ready || contentRevision === 0 || conflictInProgress.current) return;
     setSaveStatus("Сохранение в фоне…");
     void isDocumentSaveOwner(documentId).then((owner) => {
       if (owner) saver.current!.schedule(currentDraft());
     });
   }, [editor, ready, contentRevision, documentId]);
+  useEffect(() => {
+    const source = currentSourcePath.current;
+    const cloudConflict = source?.startsWith("remote:yandexDisk:") && cloudStates.yandexDisk?.status === "conflict";
+    if (!editor || !ready || (!localConflict && !cloudConflict) || conflictInProgress.current || !source) return;
+    conflictInProgress.current = true;
+    editor.setEditable(false);
+    setSaveStatus("Сохраняем отдельную версию черновика…");
+    void (async () => {
+      let preserved = false;
+      try {
+        if (!(await isDocumentSaveOwner(documentId))) return;
+        await saver.current?.suspend(documentId);
+        await preserveDraftVersion(currentDraft());
+        preserved = true;
+        const remote = source.startsWith("remote:yandexDisk:");
+        const { bytes, revision } = remote
+          ? await downloadYandexDocx(source)
+          : { bytes: await readFile(source), revision: undefined };
+        const imported = await importDocx(bytes);
+        const mainDraft: Draft = {
+          ...currentDraft(),
+          document: generateJSON(imported.html || "<p></p>", editorExtensions),
+          sourcePath: source,
+          sourceFingerprint: remote ? undefined : await fingerprint(bytes),
+          savePath: remote ? undefined : source,
+          cloudTargets: remote ? { yandexDisk: source } : {},
+          selection: undefined,
+          scrollTop: 0,
+          updatedAt: new Date().toISOString(),
+        };
+        await writeDraft(mainDraft);
+        if (remote && revision) await cloudSync.current?.acceptOpenedRemote("yandexDisk", source, revision);
+        documentChannel.current?.postMessage({ type: "source-reload" });
+        location.reload();
+      } catch {
+        setSaveStatus(preserved ? "Версия сохранена в черновиках" : "");
+        if (preserved) {
+          await showLibrary().catch(() => {});
+          if (isTauri() && getCurrentWindow().label.startsWith("doc-")) {
+            if (/Android/i.test(navigator.userAgent)) await invoke("close_task").catch(() => {});
+            else await getCurrentWindow().destroy().catch(() => {});
+          }
+        }
+      }
+    })();
+  }, [editor, ready, localConflict, cloudStates.yandexDisk?.status, documentId]);
   useEffect(() => {
     if (ready && editor) void writeDraft(currentDraft()).catch(() => {});
   }, [ready, viewMode]);
@@ -620,6 +715,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           if (!selected) return false;
           currentSavePath.current = selected;
           currentSourcePath.current = selected;
+          currentRestoreSourcePath.current = undefined;
+          currentSourceFingerprint.current = "new";
         }
         await persistCurrent();
         if (currentSourcePath.current === currentSavePath.current && currentSourcePath.current) {

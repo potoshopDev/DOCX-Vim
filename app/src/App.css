@@ -84,6 +84,9 @@ button, select { font: inherit; }
 .document-list button { width: 100%; text-align: left; border: 0; background: transparent; padding: 0.8rem 0.25rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.2rem; }
 .document-list button:hover { background: #f1f6fd; }
 .document-list span { font-size: 0.8rem; color: #687587; }
+.draft-item { display: flex; align-items: center; gap: 0.5rem; }
+.draft-item > button:first-child { flex: 1; min-width: 0; }
+.document-list .restore-button { width: auto; flex: none; border: 1px solid #aeb9c8; border-radius: 0.4rem; padding: 0.4rem 0.6rem; }
 .settings-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.8rem; }
 .settings-panel h2 { grid-column: 1 / -1; }
 .settings-panel label { display: grid; gap: 0.3rem; font-size: 0.87rem; }
@@ -102,6 +105,8 @@ button, select { font: inherit; }
 .personal-dictionary ul { display: flex; flex-wrap: wrap; gap: 0.4rem; list-style: none; padding: 0; margin: 0; max-height: 8rem; overflow: auto; }
 .personal-dictionary li { border: 1px solid #d6dde7; border-radius: 0.4rem; padding: 0.2rem 0.4rem; }
 @media (max-width: 680px) {
+  .draft-item { flex-wrap: wrap; }
+  .document-list .restore-button { margin: 0 0 0.5rem 0.25rem; }
   .app-header { align-items: stretch; flex-direction: column; padding: calc(0.65rem + max(env(safe-area-inset-top), 24px)) 0.65rem 0.65rem; }
   .app-header p { display: none; }
   .file-actions { overflow-x: auto; flex-wrap: nowrap; }

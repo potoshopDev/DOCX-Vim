@@ -9,6 +9,8 @@ export type Draft = {
   document: JSONContent;
   updatedAt: string;
   sourcePath?: string;
+  restoreSourcePath?: string;
+  sourceFingerprint?: string;
   savePath?: string;
   cloudTargets?: Partial<Record<"oneDrive" | "yandexDisk", string>>;
   viewMode?: "page" | "mobile";

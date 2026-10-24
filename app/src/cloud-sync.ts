@@ -1,12 +1,13 @@
 import { BaseDirectory, mkdir, readFile, readTextFile, rename, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
-import type { Draft } from "./draft";
+import { readDraft, type Draft } from "./draft";
+import { preserveDraftVersion } from "./source-version";
 import { isRemoteTarget, RemoteConflict, uploadRemote, verifyRemoteRevision } from "./cloud-remote";
 
 export type CloudProvider = "oneDrive" | "yandexDisk";
 export const cloudProviders: CloudProvider[] = ["oneDrive", "yandexDisk"];
 export const cloudName: Record<CloudProvider, string> = { oneDrive: "OneDrive", yandexDisk: "Яндекс Диск" };
 export type CloudStatus = "pending" | "writing" | "saved" | "retry" | "conflict";
-export type CloudState = { path: string; hash?: string; revision?: string; status: CloudStatus; conflictCopy?: string; updatedAt?: string };
+export type CloudState = { path: string; hash?: string; revision?: string; status: CloudStatus; conflictCopy?: string; conflictDraftId?: string; updatedAt?: string };
 export type CloudStates = Partial<Record<CloudProvider, CloudState>>;
 type Pending = { path: string; bytes: Uint8Array };
 type Queue = { pending?: Pending; running: boolean; timer?: number; attempts: number };
@@ -94,6 +95,16 @@ export class CloudSync {
     void this.persist();
   }
 
+  async acceptOpenedRemote(provider: CloudProvider, path: string, revision: string): Promise<void> {
+    await this.load();
+    const queue = this.queues.get(provider);
+    if (queue?.timer) clearTimeout(queue.timer);
+    if (queue) { queue.pending = undefined; queue.attempts = 0; }
+    this.states[provider] = { path, revision, status: "saved", updatedAt: new Date().toISOString() };
+    this.onChange({ ...this.states });
+    await this.persist();
+  }
+
   retry(): void {
     for (const provider of cloudProviders) {
       const queue = this.queues.get(provider);
@@ -162,7 +173,12 @@ export class CloudSync {
     await mkdir("cloud-conflicts", { baseDir: BaseDirectory.AppData, recursive: true });
     const copy = state.conflictCopy ?? `cloud-conflicts/${this.id}-${provider}.docx`;
     await writeFile(copy, bytes, { baseDir: BaseDirectory.AppData });
-    await this.update(provider, { ...state, status: "conflict", conflictCopy: copy });
+    let conflictDraftId = state.conflictDraftId;
+    if (!conflictDraftId) {
+      const draft = await readDraft(this.id);
+      if (draft && draft.sourcePath !== state.path) conflictDraftId = (await preserveDraftVersion(draft)).id;
+    }
+    await this.update(provider, { ...state, status: "conflict", conflictCopy: copy, conflictDraftId });
   }
 
   private async update(provider: CloudProvider, state: CloudState): Promise<void> {
