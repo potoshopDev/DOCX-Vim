@@ -60,7 +60,8 @@ button, select { font: inherit; }
 .status-bar { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 1rem; background: #22334b; color: white; font-size: 0.75rem; }
 .status-bar button { border: 0; background: transparent; color: white; text-decoration: underline; cursor: pointer; }
 .cloud-settings-note p { margin: 0.35rem 0 0.6rem; color: #667182; }
-.source-indicator { white-space: nowrap; font-weight: 600; }
+.source-indicator { display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; font-weight: 600; }
+.source-save-check { display: inline-flex; align-items: center; justify-content: center; width: 1.25rem; height: 1.25rem; border: 1.5px solid currentColor; border-radius: 50%; font-size: 0.85rem; line-height: 1; }
 .vim-command { display: flex; align-items: center; flex: 1; gap: 0.3rem; }
 .vim-command input { flex: 1; min-width: 3rem; border: 0; background: transparent; color: white; outline: none; font: inherit; }
 .start-screen { height: 100dvh; overflow: auto; background: #f2f5f9; }

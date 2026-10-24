@@ -30,7 +30,7 @@ export function exportInWorker(document: JSONContent): Promise<Uint8Array> {
 export class BackgroundSaver {
   private entries = new Map<string, Entry>();
   private revisions = new Map<string, string>();
-  constructor(private readonly onSaved: (id: string, path: string | undefined) => void,
+  constructor(private readonly onSaved: (draft: Draft) => void,
     private readonly delayMs = 800,
     private readonly onSnapshot?: (draft: Draft, bytes: Uint8Array) => void,
     private readonly onConflict?: (draft: Draft) => void,
@@ -114,7 +114,7 @@ export class BackgroundSaver {
             }
             this.onSnapshot?.(snapshot.draft, bytes);
           }
-          if (!entry.latest) this.onSaved(id, snapshot.draft.savePath);
+          if (!entry.latest) this.onSaved(snapshot.draft);
           entry.waiters = entry.waiters.filter((waiter) => {
             if (waiter.token > snapshot.token) return true;
             waiter.resolve();

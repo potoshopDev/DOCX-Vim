@@ -3,27 +3,39 @@ import type { Language, PersonalDictionary } from "./personal-dictionary";
 
 type Segment = { from: number; text: string };
 type Issue = { from: number; to: number; word: string; suggestions: string[]; kind: "spelling" };
-type Request = { id: number; type: "check"; segments: Segment[]; personal: PersonalDictionary } | { id: number; type: "complete"; prefix: string; language: Language; personal: PersonalDictionary } | { id: number; type: "suggest"; word: string; language: Language; personal: PersonalDictionary };
+type Request = { id: number; type: "preload" } | { id: number; type: "check"; segments: Segment[]; personal: PersonalDictionary } | { id: number; type: "complete"; prefix: string; language: Language; personal: PersonalDictionary } | { id: number; type: "suggest"; word: string; language: Language; personal: PersonalDictionary };
 const spelling = new Map<Language, ReturnType<typeof nspell>>();
 const roots = new Map<Language, string[]>();
+const loading = new Map<Language, Promise<ReturnType<typeof nspell>>>();
 
 async function load(language: Language) {
   if (spelling.has(language)) return spelling.get(language)!;
-  const [aff, dic] = await Promise.all(["aff", "dic"].map(async (ext) => {
-    const response = await fetch(`/dictionaries/${language}/index.${ext}`);
-    if (!response.ok) throw new Error(`Dictionary ${language} unavailable`);
-    return response.text();
-  }));
-  const checker = nspell({ aff, dic });
-  spelling.set(language, checker);
-  roots.set(language, dic.split(/\r?\n/).slice(1).map((line) => line.split(/[\/\t ]/, 1)[0].toLocaleLowerCase(language)).filter((word) => word.length >= 3).sort());
-  return checker;
+  let promise = loading.get(language);
+  if (!promise) {
+    promise = (async () => {
+      const [aff, dic] = await Promise.all(["aff", "dic"].map(async (ext) => {
+        const response = await fetch(`/dictionaries/${language}/index.${ext}`);
+        if (!response.ok) throw new Error(`Dictionary ${language} unavailable`);
+        return response.text();
+      }));
+      const checker = nspell({ aff, dic });
+      spelling.set(language, checker);
+      roots.set(language, dic.split(/\r?\n/).slice(1).map((line) => line.split(/[\/\t ]/, 1)[0].toLocaleLowerCase(language)).filter((word) => word.length >= 3).sort());
+      return checker;
+    })();
+    loading.set(language, promise);
+  }
+  try { return await promise; }
+  finally { loading.delete(language); }
 }
 
 self.onmessage = async (event: MessageEvent<Request>) => {
   const request = event.data;
   try {
-    if (request.type === "check") {
+    if (request.type === "preload") {
+      await Promise.all([load("ru"), load("en")]);
+      self.postMessage({ id: request.id, type: "preload" });
+    } else if (request.type === "check") {
       const [ru, en] = await Promise.all([load("ru"), load("en")]);
       const issues: Issue[] = [];
       for (const segment of request.segments) {
@@ -49,10 +61,11 @@ self.onmessage = async (event: MessageEvent<Request>) => {
       const words = roots.get(request.language)!;
       let lo = 0, hi = words.length;
       while (lo < hi) { const mid = (lo + hi) >>> 1; if (words[mid] < prefix) lo = mid + 1; else hi = mid; }
-      const candidates = [...request.personal[request.language], ...words.slice(lo, lo + 100)]
+      const candidates = [...new Set([...request.personal[request.language], ...words.slice(lo, lo + 300)])]
         .filter((word) => word.length > prefix.length && word.startsWith(prefix) && checker.correct(word));
-      const suggestion = candidates.sort((a, b) => a.length - b.length || a.localeCompare(b))[0] || checker.suggest(prefix)[0] || "";
-      self.postMessage({ id: request.id, type: "complete", suggestion });
+      const suggestions = candidates.sort((a, b) => a.length - b.length || a.localeCompare(b)).slice(0, 25);
+      if (!suggestions.length) suggestions.push(...checker.suggest(prefix).filter((word) => word.length > prefix.length).slice(0, 6));
+      self.postMessage({ id: request.id, type: "complete", suggestions });
     }
-  } catch { self.postMessage({ id: request.id, type: request.type, issues: [], suggestion: "" }); }
+  } catch { self.postMessage({ id: request.id, type: request.type, issues: [], suggestions: [] }); }
 };

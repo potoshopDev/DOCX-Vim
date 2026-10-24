@@ -8,7 +8,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { onBackButtonPress } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { emitTo, listen } from "@tauri-apps/api/event";
+import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { BaseDirectory, readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { exportDocx, importDocx } from "./docx";
@@ -61,6 +61,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [contentRevision, setContentRevision] = useState(0);
   const [localConflict, setLocalConflict] = useState(false);
   const [saveStatus, setSaveStatus] = useState("Подготовка…");
+  const [lastLocalSave, setLastLocalSave] = useState<{ path: string; updatedAt: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [cloudStates, setCloudStates] = useState<CloudStates>({});
   const [vimEnabled, setVimEnabled] = useState(true);
@@ -70,7 +71,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [selectedIssue, setSelectedIssue] = useState<CorrectionItem | null>(null);
   const [correctionPending, setCorrectionPending] = useState(false);
   const [correctionIndex, setCorrectionIndex] = useState(0);
-  const [completion, setCompletion] = useState<{ from: number; to: number; suggestion: string } | null>(null);
+  const [completion, setCompletion] = useState<{ from: number; to: number; prefix: string; suggestions: string[]; index: number } | null>(null);
   const [selectionRevision, setSelectionRevision] = useState(0);
   const issuesRef = useRef<TextIssue[]>([]);
   const selectedIssueRef = useRef<CorrectionItem | null>(null);
@@ -102,6 +103,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const vim = useRef<VimAdapter | null>(null);
   const documentChannel = useRef<BroadcastChannel | null>(null);
   const sessionRevision = useRef(-1);
+  const latestDraftUpdatedAt = useRef("");
   const hasEditLease = useRef(false);
   const cloudHandoffBlocked = useRef(false);
   const handoffRecoveryId = useRef<string | null>(null);
@@ -122,14 +124,25 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const conflictInProgress = useRef(false);
   const saver = useRef<BackgroundSaver | null>(null);
   const cloudSync = useRef<CloudSync | null>(null);
-  if (!cloudSync.current) cloudSync.current = new CloudSync(documentId, setCloudStates);
-  if (!saver.current) saver.current = new BackgroundSaver((_id, path) => {
-    setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-  }, 800, (draft, bytes) => { if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(draft, bytes); }, () => setLocalConflict(true),
+  const recordSaved = (draft: Draft) => {
+    setSaveStatus(`${draft.savePath ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
+    if (draft.savePath && draft.savePath === draft.sourcePath && !draft.sourcePath.startsWith("remote:")) {
+      setLastLocalSave({ path: draft.savePath, updatedAt: draft.updatedAt });
+      if (isTauri()) void emit("docx-vim-local-saved", { id: draft.id, path: draft.savePath, updatedAt: draft.updatedAt }).catch(() => {});
+    }
+  };
+  const reportCloudStates = (states: CloudStates) => {
+    setCloudStates(states);
+    if (isTauri() && hasEditLease.current)
+      void emit("docx-vim-cloud-states", { id: documentId, states }).catch(() => {});
+  };
+  if (!cloudSync.current) cloudSync.current = new CloudSync(documentId, reportCloudStates);
+  if (!saver.current) saver.current = new BackgroundSaver(recordSaved,
+  800, (draft, bytes) => { if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(draft, bytes); }, () => setLocalConflict(true),
   (revision) => { currentSourceFingerprint.current = revision; });
   const currentDraft = (): Draft => ({
     version: 1, id: currentId.current, name: currentName.current,
-    document: editor!.getJSON(), updatedAt: new Date().toISOString(),
+    document: editor!.getJSON(), updatedAt: new Date(Math.max(Date.now(), (Date.parse(latestDraftUpdatedAt.current) || 0) + 1)).toISOString(),
     sourcePath: currentSourcePath.current, savePath: currentSavePath.current,
     restoreSourcePath: currentRestoreSourcePath.current,
     sourceFingerprint: currentSourceFingerprint.current,
@@ -155,6 +168,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const publishCurrent = (): Promise<void> => {
     if (!isTauri() || !hasEditLease.current || !currentReady.current) return publicationQueue.current;
     const draft = currentDraft();
+    latestDraftUpdatedAt.current = draft.updatedAt;
     publicationQueue.current = publicationQueue.current.then(async () => {
       const snapshot = await invoke<SessionSnapshot>("publish_document_session", { id: documentId, draft });
       sessionRevision.current = Math.max(sessionRevision.current, snapshot.revision);
@@ -275,6 +289,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       handleKeyDown: (_view, event) => {
         if (isTauri() && (!hasEditLease.current || !_view.editable)) { event.preventDefault(); return true; }
         const editable = !vim.current?.enabled || vim.current?.mode() === "insert";
+        const candidate = completionRef.current;
+        const activeCompletion = candidate && _view.state.selection.from === candidate.to &&
+          _view.state.doc.textBetween(candidate.from, candidate.to) === candidate.prefix ? candidate : null;
         const correctionKey = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
           ? event.code === "KeyN" || ["n", "N", "т", "Т"].includes(event.key) ? 1
             : event.code === "KeyP" || ["p", "P", "з", "З"].includes(event.key) ? -1 : 0
@@ -283,6 +300,14 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           event.preventDefault();
           event.stopPropagation();
           const direction = correctionKey as 1 | -1;
+          const currentCompletion = activeCompletion;
+          if (editable && !selectedIssueRef.current && currentCompletion) {
+            const next = { ...currentCompletion,
+              index: (currentCompletion.index + direction + currentCompletion.suggestions.length) % currentCompletion.suggestions.length };
+            completionRef.current = next;
+            setCompletion(next);
+            return true;
+          }
           if (!cycleCorrection(direction)) showCorrectionsAtCaret(direction);
           return true;
         }
@@ -293,7 +318,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           if (!correctionPendingRef.current || correction.kind === "pending") acceptCorrection();
           return true;
         }
-        if (event.key === "Tab" && (!editable || !completionRef.current)) {
+        if (event.key === "Tab" && (!editable || !activeCompletion)) {
           event.preventDefault();
           event.stopPropagation();
           showCorrectionsAtCaret(1);
@@ -309,10 +334,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           setCorrectionPending(false);
           return true;
         }
-        if (editable && completionRef.current && (event.key === "Tab" || (event.ctrlKey && event.code === "Space"))) {
+        if (editable && activeCompletion && (event.key === "Tab" || (event.ctrlKey && event.code === "Space"))) {
           event.preventDefault();
-          const item = completionRef.current;
-          editor?.chain().focus().insertContentAt({ from: item.from, to: item.to }, item.suggestion).run();
+          const item = activeCompletion;
+          editor?.chain().focus().insertContentAt({ from: item.from, to: item.to }, item.suggestions[item.index]).run();
           setCompletion(null);
           return true;
         }
@@ -406,6 +431,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       const resolve = workerRequests.current.get(event.data.id);
       if (resolve) { workerRequests.current.delete(event.data.id); resolve(event.data); }
     };
+    worker.postMessage({ id: 0, type: "preload" });
     void readPersonalDictionary().then(setPersonal);
     const onDictionary = (event: Event) => setPersonal((event as CustomEvent<PersonalDictionary>).detail);
     addEventListener("personal-dictionary-changed", onDictionary);
@@ -467,14 +493,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         hasEditLease.current = session.editorLabel === getCurrentWindow().label;
         cloudHandoffBlocked.current = !!session.unconfirmedFrom;
       }
+      latestDraftUpdatedAt.current = draft.updatedAt;
       await cloudSync.current?.load();
       if (cancelled) return;
       setVimEnabled(settings.vimEnabled);
       setHideMenu(settings.hideMenu);
       setAssistSettings(settings);
-      saver.current = new BackgroundSaver((_id, path) => {
-        setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-      }, settings.autosaveMs, (savedDraft, bytes) => {
+      saver.current = new BackgroundSaver(recordSaved, settings.autosaveMs, (savedDraft, bytes) => {
         if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(savedDraft, bytes);
       },
       () => setLocalConflict(true), (revision) => {
@@ -515,6 +540,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const applySessionSnapshot = (snapshot: SessionSnapshot, force = false) => {
     if (!editor || snapshot.draft.id !== documentId || (!force && snapshot.revision <= sessionRevision.current)) return;
     sessionRevision.current = snapshot.revision;
+    latestDraftUpdatedAt.current = snapshot.draft.updatedAt;
     cloudHandoffBlocked.current = !!snapshot.unconfirmedFrom;
     const draft = snapshot.draft;
     currentName.current = draft.name;
@@ -561,7 +587,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         }
         if (owner && wasSaveOwner !== true) {
           if (wasSaveOwner === false) {
-            cloudSync.current = new CloudSync(documentId, setCloudStates);
+            cloudSync.current = new CloudSync(documentId, reportCloudStates);
             await cloudSync.current.load();
           }
           const snapshot = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
@@ -678,6 +704,12 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         }),
         listen<SessionSnapshot>("docx-vim-fingerprint", (event) => {
           if (event.payload.draft.id === documentId) currentSourceFingerprint.current = event.payload.draft.sourceFingerprint;
+        }),
+        listen<{ id: string; path: string; updatedAt: string }>("docx-vim-local-saved", (event) => {
+          if (event.payload.id === documentId) setLastLocalSave({ path: event.payload.path, updatedAt: event.payload.updatedAt });
+        }),
+        listen<{ id: string; states: CloudStates }>("docx-vim-cloud-states", (event) => {
+          if (event.payload.id === documentId) setCloudStates(event.payload.states);
         }),
         listen<SessionSnapshot>("docx-vim-handoff-confirmed", (event) => {
           if (event.payload.draft.id !== documentId || event.payload.revision < sessionRevision.current) return;
@@ -917,17 +949,20 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const { $from, empty } = editor.state.selection;
     if (!empty || !$from.parent.isTextblock) { setCompletion(null); return; }
     const before = $from.parent.textBetween(0, $from.parentOffset);
-    const prefix = before.match(/[A-Za-zА-Яа-яЁё]{3,32}$/u)?.[0];
+    const prefix = before.match(/[A-Za-zА-Яа-яЁё]{2,32}$/u)?.[0];
     if (!prefix) { setCompletion(null); return; }
     const from = $from.pos - prefix.length, to = $from.pos;
     const language: Language = /[А-Яа-яЁё]/.test(prefix) ? "ru" : "en";
     let cancelled = false;
     const timer = window.setTimeout(() => {
-      void askWorker({ type: "complete", prefix, language, personal }).then((result: { suggestion: string }) => {
-        if (cancelled || !result.suggestion || editor.state.selection.from !== to) return;
-        setCompletion({ from, to, suggestion: /^[A-ZА-ЯЁ]/.test(prefix) ? result.suggestion[0].toLocaleUpperCase(language) + result.suggestion.slice(1) : result.suggestion });
+      void askWorker({ type: "complete", prefix, language, personal }).then((result: { suggestions?: string[] }) => {
+        if (cancelled || !result.suggestions?.length || editor.state.selection.from !== to ||
+          editor.state.doc.textBetween(from, to) !== prefix) return;
+        const suggestions = result.suggestions.map((word) => /^[A-ZА-ЯЁ]/.test(prefix)
+          ? word[0].toLocaleUpperCase(language) + word.slice(1) : word);
+        setCompletion({ from, to, prefix, suggestions, index: 0 });
       });
-    }, 300);
+    }, 90);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [editor, ready, selectionRevision, vimEnabled, vimMode, assistSettings.autocomplete, personal]);
 
@@ -1179,6 +1214,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     ? selectedIssue.kind === "none" || selectedIssue.kind === "pending" ? ["Закрыть"]
       : [...selectedIssue.suggestions, ...(selectedIssue.kind === "spelling" ? ["Добавить в словарь"] : []), "Игнорировать", "Закрыть"]
     : [];
+  const sourceSaveComplete = !cloudHandoffBlocked.current && !!latestDraftUpdatedAt.current && (
+    sourceLabel === "Яндекс Диск"
+      ? cloudStates.yandexDisk?.status === "saved" && cloudStates.yandexDisk.path === currentSourcePath.current
+        && cloudStates.yandexDisk.savedDraftUpdatedAt === latestDraftUpdatedAt.current
+      : sourceLabel === "Локальный" && lastLocalSave?.path === currentSourcePath.current
+        && lastLocalSave?.updatedAt === latestDraftUpdatedAt.current
+  );
 
   const setLink = () => {
     if (!editor) return;
@@ -1304,7 +1346,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         <span>{isTauri() && !hasEditLease.current ? "Просмотр — редактирование в другом окне"
           : cloudHandoffBlocked.current ? "Ожидаем сохранения из предыдущего окна; изменения в резервном черновике"
           : vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
-        {completion && <span className="completion-hint">{completion.suggestion} · Tab / Ctrl+Space</span>}
+        {completion && <span className="completion-hint">{completion.suggestions[completion.index]} · {completion.index + 1}/{completion.suggestions.length} · Ctrl+N/P — выбор · Tab — вставить</span>}
         {commandLine !== null && <label className="vim-command">:
           <input ref={commandInput} aria-label="Команда Vim" value={commandLine}
             onChange={(event) => setCommandLine(event.target.value)}
@@ -1341,6 +1383,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         {hideMenu && <><button type="button" onClick={() => setShowHeadings((value) => !value)}>Заголовки</button><button type="button" onClick={() => void showYandexLibrary()}>Яндекс Диск</button></>}
         <span className="source-indicator" aria-label={sourceLabel === "Яндекс Диск" ? "Файл в облаке" : "Файл не в облаке"}>
           {sourceLabel === "Яндекс Диск" ? "✓ Облако" : `✕ ${sourceLabel}`}
+          {sourceSaveComplete && <span className="source-save-check" role="img" aria-label="Текущие изменения сохранены в выбранный файл" title="Текущие изменения сохранены в выбранный файл">✓</span>}
           {sourceLabel === "Яндекс Диск" && cloudStates.yandexDisk?.status === "retry" ? " · ожидает синхронизации" : ""}
           {sourceLabel === "Яндекс Диск" && cloudStates.yandexDisk?.status === "conflict" ? " · конфликт версии" : ""}
         </span>
