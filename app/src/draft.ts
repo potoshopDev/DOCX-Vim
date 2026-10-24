@@ -10,6 +10,7 @@ export type Draft = {
   updatedAt: string;
   sourcePath?: string;
   savePath?: string;
+  cloudTargets?: Partial<Record<"oneDrive" | "yandexDisk", string>>;
   viewMode?: "page" | "mobile";
   selection?: { anchor: number; head: number };
   scrollTop?: number;

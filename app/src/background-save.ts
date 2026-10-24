@@ -11,7 +11,7 @@ export class BackgroundSaveFailure extends Error {
   constructor(readonly draftSaved: boolean) { super("Background save failed"); }
 }
 
-function exportInWorker(document: JSONContent): Promise<Uint8Array> {
+export function exportInWorker(document: JSONContent): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./docx-export.worker.ts", import.meta.url), { type: "module" });
     worker.onmessage = (event: MessageEvent<{ ok: boolean; bytes?: ArrayBuffer }>) => {
@@ -27,7 +27,8 @@ function exportInWorker(document: JSONContent): Promise<Uint8Array> {
 export class BackgroundSaver {
   private entries = new Map<string, Entry>();
   constructor(private readonly onSaved: (id: string, path: string | undefined) => void,
-    private readonly delayMs = 800) {}
+    private readonly delayMs = 800,
+    private readonly onSnapshot?: (draft: Draft, bytes: Uint8Array) => void) {}
 
   private entry(id: string): Entry {
     let entry = this.entries.get(id);
@@ -68,14 +69,15 @@ export class BackgroundSaver {
         try {
           await writeDraft(snapshot.draft);
           draftSaved = true;
-          if (snapshot.draft.savePath && isTauri()) {
+          if ((snapshot.draft.savePath || Object.values(snapshot.draft.cloudTargets ?? {}).some(Boolean)) && isTauri()) {
             const bytes = await exportInWorker(snapshot.draft.document);
             await mkdir("docx-backups", { baseDir: BaseDirectory.AppData, recursive: true });
             const backup = `docx-backups/${id}.docx`;
             const temporary = `${backup}.tmp`;
             await writeFile(temporary, bytes, { baseDir: BaseDirectory.AppData });
             await rename(temporary, backup, { oldPathBaseDir: BaseDirectory.AppData, newPathBaseDir: BaseDirectory.AppData });
-            await writeFile(snapshot.draft.savePath, bytes);
+            this.onSnapshot?.(snapshot.draft, bytes);
+            if (snapshot.draft.savePath) await writeFile(snapshot.draft.savePath, bytes);
           }
           if (!entry.latest) this.onSaved(id, snapshot.draft.savePath);
           entry.waiters = entry.waiters.filter((waiter) => {

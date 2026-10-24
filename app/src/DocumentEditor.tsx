@@ -9,8 +9,10 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
+import { BaseDirectory, readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { exportDocx } from "./docx";
 import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
+import { CloudSync, cloudName, cloudProviders, type CloudProvider, type CloudStates } from "./cloud-sync";
 import { readDraft, writeDraft, type Draft } from "./draft";
 import { editorExtensions } from "./editor-extensions";
 import { readSettings } from "./settings";
@@ -50,6 +52,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [revision, setRevision] = useState(0);
   const [saveStatus, setSaveStatus] = useState("Подготовка…");
   const [busy, setBusy] = useState(false);
+  const [cloudStates, setCloudStates] = useState<CloudStates>({});
+  const [showClouds, setShowClouds] = useState(false);
   const [vimEnabled, setVimEnabled] = useState(true);
   const [hideMenu, setHideMenu] = useState(false);
   const [assistSettings, setAssistSettings] = useState<Settings>(defaultSettings);
@@ -94,16 +98,20 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const currentName = useRef(documentName);
   const currentSourcePath = useRef<string | undefined>(undefined);
   const currentSavePath = useRef<string | undefined>(undefined);
+  const currentCloudTargets = useRef<Draft["cloudTargets"]>({});
   const currentViewMode = useRef<ViewMode>("mobile");
   const currentReady = useRef(false);
   const saver = useRef<BackgroundSaver | null>(null);
+  const cloudSync = useRef<CloudSync | null>(null);
+  if (!cloudSync.current) cloudSync.current = new CloudSync(documentId, setCloudStates);
   if (!saver.current) saver.current = new BackgroundSaver((_id, path) => {
     setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-  });
+  }, 800, (draft, bytes) => cloudSync.current?.schedule(draft, bytes));
   const currentDraft = (): Draft => ({
     version: 1, id: currentId.current, name: currentName.current,
     document: editor!.getJSON(), updatedAt: new Date().toISOString(),
     sourcePath: currentSourcePath.current, savePath: currentSavePath.current,
+    cloudTargets: currentCloudTargets.current,
     viewMode: currentViewMode.current,
     selection: editor ? { anchor: editor.state.selection.anchor, head: editor.state.selection.head } : undefined,
     scrollTop: editorArea.current?.scrollTop,
@@ -341,20 +349,23 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   useEffect(() => {
     if (!editor) return;
     let cancelled = false;
-    Promise.all([readDraft(documentId), readSettings()]).then(([draft, settings]) => {
+    Promise.all([readDraft(documentId), readSettings()]).then(async ([draft, settings]) => {
       if (cancelled || !draft) return;
+      await cloudSync.current?.load();
+      if (cancelled) return;
       setVimEnabled(settings.vimEnabled);
       setHideMenu(settings.hideMenu);
       setAssistSettings(settings);
       saver.current = new BackgroundSaver((_id, path) => {
         setSaveStatus(`${path ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-      }, settings.autosaveMs);
+      }, settings.autosaveMs, (savedDraft, bytes) => cloudSync.current?.schedule(savedDraft, bytes));
       suppressUpdate.current = true;
       editor.chain().setMeta("addToHistory", false).setContent(draft.document, { emitUpdate: false }).run();
       suppressUpdate.current = false;
       currentName.current = draft.name;
       currentSourcePath.current = draft.sourcePath;
       currentSavePath.current = draft.savePath;
+      currentCloudTargets.current = draft.cloudTargets ?? {};
       setDocumentName(draft.name);
       const mode = draft.viewMode || settings.defaultView;
       currentViewMode.current = mode;
@@ -381,12 +392,21 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const channel = new BroadcastChannel(`docx-vim-${documentId}`);
     const android = isTauri() && /Android/i.test(navigator.userAgent);
     documentChannel.current = channel;
-    channel.onmessage = (event: MessageEvent<{ type: string; document?: Draft["document"]; savePath?: string }>) => {
+    channel.onmessage = (event: MessageEvent<{ type: string; document?: Draft["document"]; savePath?: string; cloudTargets?: Draft["cloudTargets"]; provider?: CloudProvider; path?: string }>) => {
       if (event.data.type === "active") { if (!android) editor.setEditable(false); return; }
+      if (event.data.type === "cloud-rebind" && event.data.provider && event.data.path) {
+        void isDocumentSaveOwner(documentId).then((owner) => { if (owner) cloudSync.current?.rebind(event.data.provider!, event.data.path!); });
+        return;
+      }
+      if (event.data.type === "cloud-disconnect" && event.data.provider) {
+        void isDocumentSaveOwner(documentId).then((owner) => { if (owner) cloudSync.current?.disconnect(event.data.provider!); });
+        return;
+      }
       if (event.data.type === "save-request") {
         void isDocumentSaveOwner(documentId).then((owner) => {
           if (!owner) return;
           if (event.data.savePath) currentSavePath.current = event.data.savePath;
+          if (event.data.cloudTargets) currentCloudTargets.current = event.data.cloudTargets;
           void saver.current?.flush(currentDraft()).catch(() => {});
         });
         return;
@@ -461,6 +481,12 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       if (owner) saver.current!.schedule(currentDraft());
     });
   }, [editor, ready, revision, documentId, documentName, viewMode]);
+  useEffect(() => {
+    const retry = () => cloudSync.current?.retry();
+    addEventListener("online", retry);
+    addEventListener("focus", retry);
+    return () => { removeEventListener("online", retry); removeEventListener("focus", retry); };
+  }, []);
 
   useEffect(() => {
     if (!editor || !ready || !checkWorker.current) return;
@@ -515,7 +541,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     if (!editor || !currentReady.current) return;
     if (!(await isDocumentSaveOwner(documentId)) && documentChannel.current) {
       await writeDraft(currentDraft());
-      documentChannel.current.postMessage({ type: "save-request", savePath: currentSavePath.current });
+      documentChannel.current.postMessage({ type: "save-request", savePath: currentSavePath.current, cloudTargets: currentCloudTargets.current });
       return;
     }
     try { await saver.current!.flush(currentDraft()); }
@@ -595,6 +621,40 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       return true;
     } catch { setSaveStatus(""); return false; }
     finally { setBusy(false); }
+  };
+
+  const bindCloud = async (provider: CloudProvider): Promise<void> => {
+    if (!editor || !ready || busy || !isTauri()) return;
+    setBusy(true);
+    try {
+      const name = `${documentName.replace(/\.docx$/i, "")}.docx`;
+      const selected = await save({ defaultPath: name, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
+      if (!selected) return;
+      currentCloudTargets.current = { ...currentCloudTargets.current, [provider]: selected };
+      if (await isDocumentSaveOwner(documentId)) cloudSync.current?.rebind(provider, selected);
+      else documentChannel.current?.postMessage({ type: "cloud-rebind", provider, path: selected });
+      await persistCurrent(true);
+      setSaveStatus(`${cloudName[provider]}: файл выбран`);
+    } catch { setSaveStatus(""); }
+    finally { setBusy(false); }
+  };
+
+  const unbindCloud = async (provider: CloudProvider): Promise<void> => {
+    const targets = { ...currentCloudTargets.current };
+    delete targets[provider];
+    currentCloudTargets.current = targets;
+    if (await isDocumentSaveOwner(documentId)) cloudSync.current?.disconnect(provider);
+    else documentChannel.current?.postMessage({ type: "cloud-disconnect", provider });
+    try { await persistCurrent(true); } catch { /* The draft remains available. */ }
+  };
+
+  const exportConflict = async (provider: CloudProvider): Promise<void> => {
+    const copy = cloudStates[provider]?.conflictCopy;
+    if (!copy) return;
+    const destination = await save({ defaultPath: `${documentName.replace(/\.docx$/i, "")}-${provider}-конфликт.docx`, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
+    if (!destination) return;
+    try { await writeFile(destination, await readFile(copy, { baseDir: BaseDirectory.AppData })); }
+    catch { /* Local conflict copy remains available for another attempt. */ }
   };
 
   const quitDocument = async (): Promise<void> => {
@@ -804,6 +864,25 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           onClick={() => applyCorrectionChoice(index)}>{choice}</button>)}
       </div>}
 
+      {showClouds && <section className="cloud-panel" aria-label="Облачные копии документа">
+        <strong>Облачные копии</strong>
+        <p>Выберите файл в папке или провайдере нужного сервиса. Каждая копия сохраняется отдельно.</p>
+        {cloudProviders.map((provider) => {
+          const path = currentCloudTargets.current?.[provider];
+          const state = cloudStates[provider];
+          const status = state?.status === "saved" ? "Файл передан провайдеру" : state?.status === "writing" ? "Запись…"
+            : state?.status === "retry" ? "Ожидает повторной записи" : state?.status === "conflict" ? "Внешнее изменение: локальная копия сохранена"
+              : path ? "Ожидает записи" : "Не подключён";
+          return <div className="cloud-row" key={provider}>
+            <div><strong>{cloudName[provider]}</strong><small>{status}</small>{path && <small title={path}>{path}</small>}</div>
+            <button type="button" disabled={busy} onClick={() => void bindCloud(provider)}>{path ? "Сменить файл" : "Выбрать файл"}</button>
+            {state?.status === "conflict" && <button type="button" onClick={() => void exportConflict(provider)}>Сохранить копию</button>}
+            {path && <button type="button" disabled={busy} onClick={() => void unbindCloud(provider)}>Отключить</button>}
+          </div>;
+        })}
+        <button type="button" onClick={() => { cloudSync.current?.retry(); setShowClouds(false); }}>Повторить и закрыть</button>
+      </section>}
+
       <footer className="status-bar">
         <span>{vimEnabled ? `Vim ${vimMode}` : "Обычный ввод"}</span>
         {completion && <span className="completion-hint">{completion.suggestion} · Tab / Ctrl+Space</span>}
@@ -841,6 +920,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
             }} />
         </label>}
         {hideMenu && <button type="button" onClick={() => setShowHeadings((value) => !value)}>Заголовки</button>}
+        <button type="button" onClick={() => setShowClouds((value) => !value)}>Облака{cloudProviders.some((provider) => currentCloudTargets.current?.[provider]) ? " ✓" : ""}</button>
         <span>{saveStatus}</span>
       </footer>
     </main>

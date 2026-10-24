@@ -180,6 +180,10 @@ export default function StartScreen() {
             <option value="mobile">Мобильный вид</option><option value="page">Страница</option>
           </select>
         </label>
+        <div className="settings-wide cloud-settings-note">
+          <strong>OneDrive и Яндекс Диск</strong>
+          <p>Подключите нужные облачные папки в системе. В окне документа откройте «Облака» в нижней панели и выберите отдельный файл в каждом сервисе. Оба файла будут обновляться при автосохранении.</p>
+        </div>
         <div className="settings-wide personal-dictionary">
           <strong>Пользовательский словарь · {settings.language === "ru" ? "русский" : "английский"}</strong>
           <div><input value={newWord} onChange={(event) => setNewWord(event.target.value)} placeholder="Новое слово" />
