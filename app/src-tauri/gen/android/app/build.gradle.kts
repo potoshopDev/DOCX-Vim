@@ -14,6 +14,13 @@ val tauriProperties = Properties().apply {
     }
 }
 
+val releaseKeystoreFile = rootProject.file("keystore.properties")
+val releaseKeystore = Properties().apply {
+    if (releaseKeystoreFile.exists()) {
+        releaseKeystoreFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     compileSdk = 37
     namespace = "ru.docxvim.app"
@@ -24,6 +31,16 @@ android {
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+    }
+    signingConfigs {
+        if (releaseKeystoreFile.exists()) {
+            create("release") {
+                keyAlias = releaseKeystore.getProperty("keyAlias")
+                keyPassword = releaseKeystore.getProperty("password")
+                storeFile = file(releaseKeystore.getProperty("storeFile"))
+                storePassword = releaseKeystore.getProperty("password")
+            }
+        }
     }
     buildTypes {
         getByName("debug") {
@@ -39,6 +56,9 @@ android {
             }
         }
         getByName("release") {
+            if (releaseKeystoreFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             optimization {
                enable = true
             }
