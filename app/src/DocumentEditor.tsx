@@ -31,6 +31,7 @@ import { focusAdjacentWindow, isDocumentSaveOwner, openDocumentWindow, openWindo
 import "./App.css";
 
 type ViewMode = "page" | "mobile";
+type CorrectionItem = TextIssue | { kind: "none" | "pending"; from: number; to: number; word: string; suggestions: string[]; message: string };
 
 function wordAtCaret(state: EditorState): { from: number; to: number; word: string } | null {
   if (!state.selection.empty) return null;
@@ -38,6 +39,7 @@ function wordAtCaret(state: EditorState): { from: number; to: number; word: stri
   if (!$from.parent.isTextblock) return null;
   const before = $from.nodeBefore?.text ?? "";
   const after = $from.nodeAfter?.text ?? "";
+  if (after && !/^[A-Za-zА-Яа-яЁё]/u.test(after)) return null;
   const text = before + after;
   for (const match of text.matchAll(/[A-Za-zА-Яа-яЁё]+(?:[’'-][A-Za-zА-Яа-яЁё]+)*/gu)) {
     const start = match.index, end = start + match[0].length;
@@ -64,13 +66,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const [hideMenu, setHideMenu] = useState(false);
   const [assistSettings, setAssistSettings] = useState<Settings>(defaultSettings);
   const [personal, setPersonal] = useState<PersonalDictionary>({ ru: [], en: [] });
-  const [selectedIssue, setSelectedIssue] = useState<TextIssue | null>(null);
+  const [selectedIssue, setSelectedIssue] = useState<CorrectionItem | null>(null);
   const [correctionPending, setCorrectionPending] = useState(false);
   const [correctionIndex, setCorrectionIndex] = useState(0);
   const [completion, setCompletion] = useState<{ from: number; to: number; suggestion: string } | null>(null);
   const [selectionRevision, setSelectionRevision] = useState(0);
   const issuesRef = useRef<TextIssue[]>([]);
-  const selectedIssueRef = useRef<TextIssue | null>(null);
+  const selectedIssueRef = useRef<CorrectionItem | null>(null);
   const correctionIndexRef = useRef(0);
   const correctionRequest = useRef(0);
   const correctionPendingRef = useRef(false);
@@ -128,7 +130,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     selection: editor ? { anchor: editor.state.selection.anchor, head: editor.state.selection.head } : undefined,
     scrollTop: editorArea.current?.scrollTop,
   });
-  const correctionChoiceCount = (issue: TextIssue) => issue.suggestions.length + (issue.kind === "spelling" ? 3 : 2);
+  const correctionChoiceCount = (issue: CorrectionItem) => issue.kind === "none" || issue.kind === "pending" ? 1 : issue.suggestions.length + (issue.kind === "spelling" ? 3 : 2);
   const applyCorrectionChoice = (index: number): boolean => {
     const issue = selectedIssueRef.current;
     if (!issue || !editor) return false;
@@ -178,7 +180,16 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const showCorrectionsAtCaret = (direction: 1 | -1) => {
     if (!editor) return;
     const target = wordAtCaret(editor.state);
-    if (!target) { selectedIssueRef.current = null; correctionPendingRef.current = false; setSelectedIssue(null); setCorrectionPending(false); return; }
+    if (!target) {
+      correctionRequest.current++;
+      const caret = editor.state.selection.from;
+      const notice: CorrectionItem = { kind: "none", from: caret, to: caret, word: "", suggestions: [], message: "Ошибок нет" };
+      selectedIssueRef.current = notice;
+      correctionPendingRef.current = false;
+      correctionIndexRef.current = 0;
+      flushSync(() => { setSelectedIssue(notice); setCorrectionIndex(0); setCorrectionPending(false); });
+      return;
+    }
     const issue = issuesRef.current.find((item) => item.from === target.from && item.to === target.to);
     if (issue?.kind === "grammar") {
       selectedIssueRef.current = issue;
@@ -193,22 +204,25 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     const request = ++correctionRequest.current;
     const caret = editor.state.selection.from;
     const language: Language = /[А-Яа-яЁё]/.test(target.word) ? "ru" : "en";
-    const pending: TextIssue = issue ?? { ...target, kind: "spelling", suggestions: [] };
+    const pending: CorrectionItem = { ...target, kind: "pending", suggestions: [], message: "Проверяем слово…" };
     selectedIssueRef.current = pending;
     correctionPendingRef.current = true;
     pendingCorrectionOffset.current = direction === -1 ? -1 : 0;
-    flushSync(() => { setSelectedIssue(pending); setCorrectionPending(true); });
+    correctionIndexRef.current = 0;
+    flushSync(() => { setSelectedIssue(pending); setCorrectionIndex(0); setCorrectionPending(true); });
     void askWorker({ type: "suggest", word: target.word, language, personal: personalRef.current })
       .then((result: { suggestions?: string[]; correct?: boolean }) => {
         if (request !== correctionRequest.current || !editor || editor.state.selection.from !== caret ||
           editor.state.doc.textBetween(target.from, target.to) !== target.word) return;
         if (result.correct) {
-          selectedIssueRef.current = null;
+          const notice: CorrectionItem = { ...target, kind: "none", suggestions: [], message: "Ошибок нет" };
+          selectedIssueRef.current = notice;
           correctionPendingRef.current = false;
-          flushSync(() => { setSelectedIssue(null); setCorrectionPending(false); });
+          correctionIndexRef.current = 0;
+          flushSync(() => { setSelectedIssue(notice); setCorrectionIndex(0); setCorrectionPending(false); });
           return;
         }
-        const next = { ...pending, suggestions: result.suggestions ?? [] };
+        const next: TextIssue = { ...(issue ?? { ...target, kind: "spelling" }), suggestions: result.suggestions ?? [] };
         selectedIssueRef.current = next;
         correctionPendingRef.current = false;
         const index = next.suggestions.length
@@ -234,10 +248,10 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           return true;
         }
         const correction = selectedIssueRef.current;
-        if (event.key === "Tab" && correction) {
+        if ((event.key === "Tab" || event.key === "Enter" || event.key === " ") && correction && !event.ctrlKey && !event.altKey && !event.metaKey) {
           event.preventDefault();
           event.stopPropagation();
-          if (!correctionPendingRef.current) acceptCorrection();
+          if (!correctionPendingRef.current || correction.kind === "pending") acceptCorrection();
           return true;
         }
         if (event.key === "Tab" && (!editable || !completionRef.current)) {
@@ -835,7 +849,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     },
   }) ?? [];
   const correctionChoices = selectedIssue
-    ? [...selectedIssue.suggestions, ...(selectedIssue.kind === "spelling" ? ["Добавить в словарь"] : []), "Игнорировать", "Закрыть"]
+    ? selectedIssue.kind === "none" || selectedIssue.kind === "pending" ? ["Закрыть"]
+      : [...selectedIssue.suggestions, ...(selectedIssue.kind === "spelling" ? ["Добавить в словарь"] : []), "Игнорировать", "Закрыть"]
     : [];
 
   const setLink = () => {
@@ -941,9 +956,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           if (direction) {
             event.preventDefault(); event.stopPropagation();
             cycleCorrection(direction as 1 | -1);
-          } else if (event.key === "Tab") {
+          } else if (["Tab", "Enter", " "].includes(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey) {
             event.preventDefault(); event.stopPropagation();
-            if (!correctionPendingRef.current) acceptCorrection();
+            if (!correctionPendingRef.current || selectedIssue.kind === "pending") acceptCorrection();
           } else if (event.key === "Escape") {
             event.preventDefault(); event.stopPropagation();
             applyCorrectionChoice(correctionChoices.length - 1);
@@ -951,8 +966,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
         }}>
         <span>{selectedIssue.message || `Слово «${selectedIssue.word}» не найдено в словаре`}</span>
         {correctionPending && <span>Подбираем варианты…</span>}
-        {!correctionPending && !selectedIssue.suggestions.length && <span>Вариантов нет</span>}
-        <span>Выбрано: {correctionChoices[correctionIndex]} · Ctrl+N/P — выбор · Tab — выполнить</span>
+        {!correctionPending && selectedIssue.kind !== "none" && !selectedIssue.suggestions.length && <span>Вариантов нет</span>}
+        {selectedIssue.kind !== "none" && selectedIssue.kind !== "pending" && <span>Выбрано: {correctionChoices[correctionIndex]} · Ctrl+N/P — выбор · Tab/Enter/Пробел — выполнить</span>}
         {correctionChoices.map((choice, index) => <button type="button" key={`${choice}-${index}`}
           className={index === correctionIndex ? "correction-choice--active" : ""} aria-pressed={index === correctionIndex}
           onClick={() => applyCorrectionChoice(index)}>{choice}</button>)}
