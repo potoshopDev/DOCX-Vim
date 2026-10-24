@@ -45,6 +45,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![register_task, focus_task, close_task])
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_keyring_store::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

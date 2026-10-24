@@ -32,6 +32,7 @@
     "nspell": "^2.1.5",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "tauri-plugin-keyring-store-api": "^0.2.0",
     "vim-prosemirror": "^0.2.1"
   },
   "devDependencies": {

@@ -90,6 +90,11 @@ button, select { font: inherit; }
 .settings-panel select { border: 1px solid #aeb9c8; border-radius: 0.4rem; padding: 0.6rem; background: white; }
 .settings-panel input { border: 1px solid #aeb9c8; border-radius: 0.4rem; padding: 0.6rem; background: white; min-width: 0; }
 .settings-wide { grid-column: 1 / -1; }
+.cloud-settings-note { display: grid; gap: 0.5rem; border-top: 1px solid #e1e6ed; padding-top: 0.7rem; }
+.cloud-account-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.cloud-account-row span { flex: 1; min-width: 11rem; }
+.cloud-account-row input { flex: 1; min-width: 10rem; }
+.cloud-account-row button { border: 1px solid #afbdcf; border-radius: 0.4rem; background: white; padding: 0.4rem 0.6rem; }
 .personal-dictionary { display: grid; gap: 0.5rem; font-size: 0.87rem; }
 .personal-dictionary > div { display: flex; gap: 0.5rem; }
 .personal-dictionary > div input { flex: 1; }

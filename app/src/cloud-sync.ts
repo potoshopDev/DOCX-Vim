@@ -1,11 +1,12 @@
 import { BaseDirectory, mkdir, readFile, readTextFile, rename, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import type { Draft } from "./draft";
+import { isRemoteTarget, RemoteConflict, uploadRemote, verifyRemoteRevision } from "./cloud-remote";
 
 export type CloudProvider = "oneDrive" | "yandexDisk";
 export const cloudProviders: CloudProvider[] = ["oneDrive", "yandexDisk"];
 export const cloudName: Record<CloudProvider, string> = { oneDrive: "OneDrive", yandexDisk: "Яндекс Диск" };
 export type CloudStatus = "pending" | "writing" | "saved" | "retry" | "conflict";
-export type CloudState = { path: string; hash?: string; status: CloudStatus; conflictCopy?: string; updatedAt?: string };
+export type CloudState = { path: string; hash?: string; revision?: string; status: CloudStatus; conflictCopy?: string; updatedAt?: string };
 export type CloudStates = Partial<Record<CloudProvider, CloudState>>;
 type Pending = { path: string; bytes: Uint8Array };
 type Queue = { pending?: Pending; running: boolean; timer?: number; attempts: number };
@@ -111,6 +112,17 @@ export class CloudSync {
           }
           await this.update(provider, { ...state, status: "writing" });
           const newHash = await sha256(pending.bytes);
+          if (isRemoteTarget(pending.path)) {
+            if (state.hash === newHash && state.revision) {
+              await verifyRemoteRevision(provider, pending.path, state.revision);
+              await this.update(provider, { ...state, status: "saved" });
+              continue;
+            }
+            const revision = await uploadRemote(provider, pending.path, pending.bytes, state.revision);
+            await this.update(provider, { path: pending.path, hash: newHash, revision, status: "saved", updatedAt: new Date().toISOString() });
+            queue.attempts = 0;
+            continue;
+          }
           if (state.hash) {
             const remoteHash = await sha256(await readFile(pending.path));
             if (remoteHash !== state.hash) {
@@ -121,7 +133,11 @@ export class CloudSync {
           if (state.hash !== newHash) await writeFile(pending.path, pending.bytes);
           await this.update(provider, { path: pending.path, hash: newHash, status: "saved", updatedAt: new Date().toISOString() });
           queue.attempts = 0;
-        } catch {
+        } catch (error) {
+          if (error instanceof RemoteConflict) {
+            try { await this.keepConflictCopy(provider, state, pending.bytes); } catch { queue.pending = queue.pending ?? pending; this.setRetry(provider, queue); }
+            continue;
+          }
           queue.pending = queue.pending ?? pending;
           try { await this.update(provider, { ...state, status: "retry" }); } catch { /* Retry can recover the ledger too. */ }
           this.setRetry(provider, queue);

@@ -11,10 +11,12 @@ export type Settings = {
   autocorrect: boolean;
   autocomplete: boolean;
   grammarUrl: string;
+  oneDriveClientId: string;
+  yandexClientId: string;
 };
 export const defaultSettings: Settings = {
   autosaveMs: 800, language: "ru", vimLayout: "physical", defaultView: "mobile", vimEnabled: true, hideMenu: false,
-  autocorrect: true, autocomplete: true, grammarUrl: "",
+  autocorrect: true, autocomplete: true, grammarUrl: "", oneDriveClientId: "", yandexClientId: "",
 };
 const file = "library/settings.json";
 const storageKey = "docx-vim-settings";
@@ -34,6 +36,8 @@ export async function readSettings(): Promise<Settings> {
       autocorrect: value.autocorrect !== false,
       autocomplete: value.autocomplete !== false,
       grammarUrl: typeof value.grammarUrl === "string" ? value.grammarUrl.trim() : "",
+      oneDriveClientId: typeof value.oneDriveClientId === "string" ? value.oneDriveClientId.trim() : "",
+      yandexClientId: typeof value.yandexClientId === "string" ? value.yandexClientId.trim() : "",
     };
   } catch { return defaultSettings; }
 }

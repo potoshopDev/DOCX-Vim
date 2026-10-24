@@ -5,6 +5,7 @@ import { basename } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { importDocx } from "./docx";
 import { editorExtensions } from "./editor-extensions";
 import { listDrafts, readDraft, writeDraft, type Draft } from "./draft";
@@ -12,6 +13,8 @@ import { listRecent, rememberDocument, type RecentDocument } from "./library";
 import { defaultSettings, readSettings, writeSettings, type Settings } from "./settings";
 import { readPersonalDictionary, writePersonalDictionary, type Language, type PersonalDictionary } from "./personal-dictionary";
 import { openDocumentWindow, openWindowIds } from "./windows";
+import { beginYandex, completeOneDrive, completeYandex, disconnect, isConnected, requestOneDriveCode, type DeviceCode } from "./cloud-auth";
+import type { CloudProvider } from "./cloud-sync";
 
 export default function StartScreen() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -22,6 +25,12 @@ export default function StartScreen() {
   const [busy, setBusy] = useState(false);
   const [personal, setPersonal] = useState<PersonalDictionary>({ ru: [], en: [] });
   const [newWord, setNewWord] = useState("");
+  const [cloudConnected, setCloudConnected] = useState<Record<CloudProvider, boolean>>({ oneDrive: false, yandexDisk: false });
+  const [cloudMessage, setCloudMessage] = useState("");
+  const [oneDriveCode, setOneDriveCode] = useState<DeviceCode | null>(null);
+  const [yandexVerifier, setYandexVerifier] = useState("");
+  const [yandexCode, setYandexCode] = useState("");
+  const authAbort = useRef<AbortController | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const refresh = useCallback(async () => {
     const [savedDrafts, savedRecent, windows] = await Promise.all([listDrafts(), listRecent(), openWindowIds()]);
@@ -35,6 +44,14 @@ export default function StartScreen() {
     addEventListener("focus", onFocus);
     return () => removeEventListener("focus", onFocus);
   }, [refresh]);
+  useEffect(() => {
+    if (!isTauri()) return;
+    void Promise.all([
+      isConnected("oneDrive", settings.oneDriveClientId).catch(() => false),
+      isConnected("yandexDisk", settings.yandexClientId).catch(() => false),
+    ]).then(([oneDrive, yandexDisk]) => setCloudConnected({ oneDrive, yandexDisk }));
+  }, [settings.oneDriveClientId, settings.yandexClientId, cloudMessage]);
+  useEffect(() => () => authAbort.current?.abort(), []);
   useEffect(() => {
     if (!isTauri() || /Android/i.test(navigator.userAgent)) return;
     const main = getCurrentWindow();
@@ -118,6 +135,44 @@ export default function StartScreen() {
     void writePersonalDictionary(next).catch(() => {});
   };
 
+  const connectOneDrive = async () => {
+    if (!settings.oneDriveClientId.trim()) { setCloudMessage("Укажите Client ID OneDrive"); return; }
+    try {
+      authAbort.current?.abort();
+      const controller = new AbortController();
+      authAbort.current = controller;
+      const code = await requestOneDriveCode(settings.oneDriveClientId.trim());
+      setOneDriveCode(code);
+      setCloudMessage("Введите код на странице Microsoft и вернитесь в приложение");
+      void openUrl(code.verification_uri).catch(() => {});
+      await completeOneDrive(settings.oneDriveClientId.trim(), code, controller.signal);
+      if (!controller.signal.aborted) { setCloudMessage("OneDrive подключён"); setOneDriveCode(null); }
+    } catch { setCloudMessage("OneDrive: подключение не завершено"); setOneDriveCode(null); }
+  };
+
+  const connectYandex = async () => {
+    if (!settings.yandexClientId.trim()) { setCloudMessage("Укажите Client ID Яндекс Диска"); return; }
+    try {
+      const flow = await beginYandex(settings.yandexClientId.trim());
+      setYandexVerifier(flow.verifier);
+      setYandexCode("");
+      setCloudMessage("Скопируйте код со страницы Яндекса в поле ниже");
+      void openUrl(flow.url).catch(() => {});
+    } catch { setCloudMessage("Яндекс Диск: подключение не начато"); }
+  };
+
+  const finishYandex = async () => {
+    try {
+      await completeYandex(settings.yandexClientId.trim(), yandexCode, yandexVerifier);
+      setYandexVerifier(""); setYandexCode(""); setCloudMessage("Яндекс Диск подключён");
+    } catch { setCloudMessage("Код Яндекса не принят. Начните подключение заново"); setYandexVerifier(""); }
+  };
+
+  const disconnectCloud = async (provider: CloudProvider) => {
+    await disconnect(provider);
+    setCloudMessage(`${provider === "oneDrive" ? "OneDrive" : "Яндекс Диск"}: аккаунт отключён`);
+  };
+
   return <main className="start-screen">
     <header className="start-header">
       <div><h1>DOCX Vim</h1><p>Документы и черновики</p></div>
@@ -182,7 +237,25 @@ export default function StartScreen() {
         </label>
         <div className="settings-wide cloud-settings-note">
           <strong>OneDrive и Яндекс Диск</strong>
-          <p>Подключите нужные облачные папки в системе. В окне документа откройте «Облака» в нижней панели и выберите отдельный файл в каждом сервисе. Оба файла будут обновляться при автосохранении.</p>
+          <p>На Windows можно выбрать папки синхронизации. На Android подключите аккаунты здесь, затем выберите облачные копии в окне документа.</p>
+          <label>Client ID приложения Microsoft
+            <input value={settings.oneDriveClientId} onChange={(event) => changeSetting({ oneDriveClientId: event.target.value })} placeholder="Идентификатор приложения OneDrive" />
+          </label>
+          <div className="cloud-account-row"><span>OneDrive: {cloudConnected.oneDrive ? "подключён" : "не подключён"}</span>
+            <button type="button" onClick={() => void connectOneDrive()}>Подключить</button>
+            {cloudConnected.oneDrive && <button type="button" onClick={() => void disconnectCloud("oneDrive")}>Отключить</button>}
+          </div>
+          {oneDriveCode && <p>Откройте {oneDriveCode.verification_uri} и введите код <strong>{oneDriveCode.user_code}</strong></p>}
+          <label>Client ID приложения Яндекс OAuth
+            <input value={settings.yandexClientId} onChange={(event) => changeSetting({ yandexClientId: event.target.value })} placeholder="Идентификатор приложения Яндекс Диска" />
+          </label>
+          <div className="cloud-account-row"><span>Яндекс Диск: {cloudConnected.yandexDisk ? "подключён" : "не подключён"}</span>
+            <button type="button" onClick={() => void connectYandex()}>Подключить</button>
+            {cloudConnected.yandexDisk && <button type="button" onClick={() => void disconnectCloud("yandexDisk")}>Отключить</button>}
+          </div>
+          {yandexVerifier && <div className="cloud-account-row"><input value={yandexCode} onChange={(event) => setYandexCode(event.target.value)} placeholder="Код со страницы Яндекса" />
+            <button type="button" onClick={() => void finishYandex()} disabled={!yandexCode.trim()}>Продолжить</button></div>}
+          {cloudMessage && <small>{cloudMessage}</small>}
         </div>
         <div className="settings-wide personal-dictionary">
           <strong>Пользовательский словарь · {settings.language === "ru" ? "русский" : "английский"}</strong>

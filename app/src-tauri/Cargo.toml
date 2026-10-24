@@ -27,6 +27,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-http = "2"
+tauri-plugin-keyring-store = { version = "0.2.0", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

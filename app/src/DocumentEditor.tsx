@@ -13,6 +13,8 @@ import { BaseDirectory, readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { exportDocx } from "./docx";
 import { BackgroundSaveFailure, BackgroundSaver } from "./background-save";
 import { CloudSync, cloudName, cloudProviders, type CloudProvider, type CloudStates } from "./cloud-sync";
+import { isConnected } from "./cloud-auth";
+import { isRemoteTarget, remoteTarget } from "./cloud-remote";
 import { readDraft, writeDraft, type Draft } from "./draft";
 import { editorExtensions } from "./editor-extensions";
 import { readSettings } from "./settings";
@@ -627,14 +629,25 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     if (!editor || !ready || busy || !isTauri()) return;
     setBusy(true);
     try {
-      const name = `${documentName.replace(/\.docx$/i, "")}.docx`;
-      const selected = await save({ defaultPath: name, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
+      let selected: string | null;
+      if (/Android/i.test(navigator.userAgent)) {
+        const settings = await readSettings();
+        const clientId = provider === "oneDrive" ? settings.oneDriveClientId : settings.yandexClientId;
+        if (!(await isConnected(provider, clientId))) {
+          setSaveStatus(`${cloudName[provider]}: подключите аккаунт в настройках стартового окна`);
+          return;
+        }
+        selected = remoteTarget(provider, documentId, documentName);
+      } else {
+        const name = `${documentName.replace(/\.docx$/i, "")}.docx`;
+        selected = await save({ defaultPath: name, filters: [{ name: "Документ Word", extensions: ["docx"] }] });
+      }
       if (!selected) return;
       currentCloudTargets.current = { ...currentCloudTargets.current, [provider]: selected };
       if (await isDocumentSaveOwner(documentId)) cloudSync.current?.rebind(provider, selected);
       else documentChannel.current?.postMessage({ type: "cloud-rebind", provider, path: selected });
       await persistCurrent(true);
-      setSaveStatus(`${cloudName[provider]}: файл выбран`);
+      setSaveStatus(`${cloudName[provider]}: облачная копия подключена`);
     } catch { setSaveStatus(""); }
     finally { setBusy(false); }
   };
@@ -866,16 +879,16 @@ function DocumentEditor({ documentId }: { documentId: string }) {
 
       {showClouds && <section className="cloud-panel" aria-label="Облачные копии документа">
         <strong>Облачные копии</strong>
-        <p>Выберите файл в папке или провайдере нужного сервиса. Каждая копия сохраняется отдельно.</p>
+        <p>{/Android/i.test(navigator.userAgent) ? "Подключите аккаунты в настройках стартового окна. Здесь включите нужные облачные копии." : "Выберите файл в синхронизируемой папке нужного сервиса. Каждая копия сохраняется отдельно."}</p>
         {cloudProviders.map((provider) => {
           const path = currentCloudTargets.current?.[provider];
           const state = cloudStates[provider];
-          const status = state?.status === "saved" ? "Файл передан провайдеру" : state?.status === "writing" ? "Запись…"
+          const status = state?.status === "saved" ? (path && isRemoteTarget(path) ? "Сохранено в облаке" : "Файл передан провайдеру") : state?.status === "writing" ? "Запись…"
             : state?.status === "retry" ? "Ожидает повторной записи" : state?.status === "conflict" ? "Внешнее изменение: локальная копия сохранена"
               : path ? "Ожидает записи" : "Не подключён";
           return <div className="cloud-row" key={provider}>
-            <div><strong>{cloudName[provider]}</strong><small>{status}</small>{path && <small title={path}>{path}</small>}</div>
-            <button type="button" disabled={busy} onClick={() => void bindCloud(provider)}>{path ? "Сменить файл" : "Выбрать файл"}</button>
+            <div><strong>{cloudName[provider]}</strong><small>{status}</small>{path && <small title={path}>{isRemoteTarget(path) ? decodeURIComponent(path.slice(path.lastIndexOf(":") + 1)) : path}</small>}</div>
+            <button type="button" disabled={busy || !!(path && isRemoteTarget(path))} onClick={() => void bindCloud(provider)}>{path && isRemoteTarget(path) ? "Подключено" : /Android/i.test(navigator.userAgent) ? "Подключить копию" : path ? "Сменить файл" : "Выбрать файл"}</button>
             {state?.status === "conflict" && <button type="button" onClick={() => void exportConflict(provider)}>Сохранить копию</button>}
             {path && <button type="button" disabled={busy} onClick={() => void unbindCloud(provider)}>Отключить</button>}
           </div>;
