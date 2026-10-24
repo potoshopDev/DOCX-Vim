@@ -1,8 +1,9 @@
 import type { JSONContent } from "@tiptap/core";
 import { isTauri } from "@tauri-apps/api/core";
 import { BaseDirectory, mkdir, readFile, rename, writeFile } from "@tauri-apps/plugin-fs";
-import { writeDraft, type Draft } from "./draft";
-import { fingerprint } from "./source-version";
+import { readDraft, writeDraft, type Draft } from "./draft";
+import { documentContentHash, fingerprint } from "./source-version";
+import { draftNeedsWrite, localNeedsWrite } from "./save-decision";
 
 type Snapshot = { draft: Draft; token: number };
 type Waiter = { token: number; resolve: () => void; reject: (error: Error) => void };
@@ -30,11 +31,12 @@ export function exportInWorker(document: JSONContent): Promise<Uint8Array> {
 export class BackgroundSaver {
   private entries = new Map<string, Entry>();
   private revisions = new Map<string, string>();
-  constructor(private readonly onSaved: (draft: Draft) => void,
+  constructor(private readonly onSaved: (draft: Draft, localWritten: boolean) => void,
     private readonly delayMs = 800,
-    private readonly onSnapshot?: (draft: Draft, bytes: Uint8Array) => void,
+    private readonly onSnapshot?: (draft: Draft, bytes: Uint8Array, documentHash: string) => void,
     private readonly onConflict?: (draft: Draft) => void,
-    private readonly onSourceSaved?: (revision: string) => void) {}
+    private readonly onSourceSaved?: (revision: string) => void,
+    private readonly needsCloudSave?: (draft: Draft, documentHash: string) => boolean) {}
 
   private entry(id: string): Entry {
     let entry = this.entries.get(id);
@@ -86,16 +88,28 @@ export class BackgroundSaver {
         entry.latest = undefined;
         let draftSaved = false;
         try {
-          await writeDraft(snapshot.draft);
+          const previous = await readDraft(id);
+          const documentHash = await documentContentHash(snapshot.draft.document);
+          if (previous && previous.sourcePath === snapshot.draft.sourcePath && previous.savePath === snapshot.draft.savePath &&
+            previous.localSavePath === snapshot.draft.savePath && previous.localSaveContentHash) {
+            snapshot.draft.localSavePath = previous.localSavePath;
+            snapshot.draft.localSaveContentHash = previous.localSaveContentHash;
+            if (previous.sourceFingerprint && snapshot.draft.sourcePath === snapshot.draft.savePath)
+              snapshot.draft.sourceFingerprint = this.revisions.get(id) ?? previous.sourceFingerprint;
+          }
+          const needsDraftWrite = draftNeedsWrite(previous, snapshot.draft);
+          if (needsDraftWrite) await writeDraft(snapshot.draft);
           draftSaved = true;
-          if ((snapshot.draft.savePath || Object.values(snapshot.draft.cloudTargets ?? {}).some(Boolean)) && isTauri()) {
+          const needsLocalWrite = localNeedsWrite(snapshot.draft, documentHash);
+          const cloudNeedsWrite = this.needsCloudSave?.(snapshot.draft, documentHash) ?? false;
+          if ((needsLocalWrite || cloudNeedsWrite) && isTauri()) {
             const bytes = await exportInWorker(snapshot.draft.document);
             await mkdir("docx-backups", { baseDir: BaseDirectory.AppData, recursive: true });
             const backup = `docx-backups/${id}.docx`;
             const temporary = `${backup}.tmp`;
             await writeFile(temporary, bytes, { baseDir: BaseDirectory.AppData });
             await rename(temporary, backup, { oldPathBaseDir: BaseDirectory.AppData, newPathBaseDir: BaseDirectory.AppData });
-            if (snapshot.draft.savePath) {
+            if (needsLocalWrite && snapshot.draft.savePath) {
               const mainLocalSource = snapshot.draft.sourcePath === snapshot.draft.savePath;
               if (mainLocalSource) {
                 const expected = this.revisions.get(id) ?? snapshot.draft.sourceFingerprint;
@@ -104,17 +118,20 @@ export class BackgroundSaver {
                   throw new LocalSourceConflict("Local source changed");
               }
               await writeFile(snapshot.draft.savePath, bytes);
+              snapshot.draft.localSavePath = snapshot.draft.savePath;
+              snapshot.draft.localSaveContentHash = documentHash;
               if (mainLocalSource) {
                 const revision = await fingerprint(bytes);
                 this.revisions.set(id, revision);
                 snapshot.draft.sourceFingerprint = revision;
-                await writeDraft(snapshot.draft);
                 this.onSourceSaved?.(revision);
               }
+              await writeDraft(snapshot.draft);
             }
-            this.onSnapshot?.(snapshot.draft, bytes);
+            if (cloudNeedsWrite) this.onSnapshot?.(snapshot.draft, bytes, documentHash);
           }
-          if (!entry.latest) this.onSaved(snapshot.draft);
+          if (!entry.latest && (needsDraftWrite || needsLocalWrite || cloudNeedsWrite))
+            this.onSaved(snapshot.draft, needsLocalWrite);
           entry.waiters = entry.waiters.filter((waiter) => {
             if (waiter.token > snapshot.token) return true;
             waiter.resolve();

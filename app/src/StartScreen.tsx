@@ -18,7 +18,7 @@ import { openDocumentWindow, openWindowIds } from "./windows";
 import { beginYandex, completeOneDrive, completeYandex, disconnect, isConnected, requestOneDriveCode, type DeviceCode } from "./cloud-auth";
 import { rememberOpenedRemote, type CloudProvider } from "./cloud-sync";
 import { downloadYandexDocx, isRemoteTarget, listYandexDocx, uploadRemote, type RemoteFile } from "./cloud-remote";
-import { fingerprint, replaceSourceDraft } from "./source-version";
+import { documentContentHash, fingerprint, replaceSourceDraft } from "./source-version";
 
 export default function StartScreen() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -102,17 +102,22 @@ export default function StartScreen() {
 
   const importBytes = async (bytes: Uint8Array, name: string, sourcePath?: string, id: string = crypto.randomUUID(), revision?: string) => {
     const imported = await importDocx(bytes);
+    const document = generateJSON(imported.html || "<p></p>", editorExtensions);
+    const contentHash = await documentContentHash(document);
+    const localPath = sourcePath && !isRemoteTarget(sourcePath) ? sourcePath : undefined;
     const draft: Draft = {
-      version: 1, id, name, document: generateJSON(imported.html || "<p></p>", editorExtensions),
+      version: 1, id, name, document,
       updatedAt: new Date().toISOString(), sourcePath,
-      sourceFingerprint: sourcePath && !isRemoteTarget(sourcePath) ? await fingerprint(bytes) : undefined,
-      savePath: sourcePath && !isRemoteTarget(sourcePath) ? sourcePath : undefined,
+      sourceFingerprint: localPath ? await fingerprint(bytes) : undefined,
+      savePath: localPath,
+      localSavePath: localPath,
+      localSaveContentHash: localPath ? contentHash : undefined,
       cloudTargets: sourcePath?.startsWith("remote:yandexDisk:") ? { yandexDisk: sourcePath } : {},
     };
     if (sourcePath) await replaceSourceDraft(draft);
     else await writeDraft(draft);
     if (sourcePath?.startsWith("remote:yandexDisk:") && revision)
-      await rememberOpenedRemote(id, "yandexDisk", sourcePath, revision);
+      await rememberOpenedRemote(id, "yandexDisk", sourcePath, revision, contentHash);
     await showDocument(draft);
   };
 
@@ -138,7 +143,9 @@ export default function StartScreen() {
   const openBackup = async (draft: Draft) => {
     const backed = !!(draft.sourcePath || draft.savePath || Object.values(draft.cloudTargets ?? {}).some(Boolean));
     const backup = backed ? { ...draft, id: crypto.randomUUID(), restoreSourcePath: draft.sourcePath ?? draft.restoreSourcePath,
-      sourcePath: undefined, sourceFingerprint: undefined, savePath: undefined, cloudTargets: {}, updatedAt: new Date().toISOString() } : draft;
+      sourcePath: undefined, sourceFingerprint: undefined, savePath: undefined,
+      localSavePath: undefined, localSaveContentHash: undefined,
+      cloudTargets: {}, updatedAt: new Date().toISOString() } : draft;
     if (backup !== draft) await writeDraft(backup);
     await showDocument(backup);
   };
@@ -173,13 +180,16 @@ export default function StartScreen() {
         if (await fingerprint(await readFile(source)) !== await fingerprint(current.bytes)) throw new Error("Source changed during restore");
         await writeFile(source, bytes);
       }
+      const restoredHash = await documentContentHash(savedBackup.document);
       await writeDraft({
         version: 1, id, name, document: savedBackup.document, updatedAt: new Date().toISOString(), sourcePath: source,
         sourceFingerprint: remote ? undefined : await fingerprint(bytes),
         savePath: remote ? undefined : source,
+        localSavePath: remote ? undefined : source,
+        localSaveContentHash: remote ? undefined : restoredHash,
         cloudTargets: remote ? { yandexDisk: source } : {},
       });
-      if (remote && revision) await rememberOpenedRemote(id, "yandexDisk", source, revision);
+      if (remote && revision) await rememberOpenedRemote(id, "yandexDisk", source, revision, restoredHash);
       await rememberDocument({ id, name, sourcePath: source });
       await openDocumentWindow(id, name);
       await refresh();

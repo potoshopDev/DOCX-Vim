@@ -12,6 +12,8 @@ export type Draft = {
   restoreSourcePath?: string;
   sourceFingerprint?: string;
   savePath?: string;
+  localSavePath?: string;
+  localSaveContentHash?: string;
   cloudTargets?: Partial<Record<"oneDrive" | "yandexDisk", string>>;
   viewMode?: "page" | "mobile";
   selection?: { anchor: number; head: number };

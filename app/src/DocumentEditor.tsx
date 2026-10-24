@@ -18,7 +18,7 @@ import { downloadYandexDocx } from "./cloud-remote";
 import { readDraft, writeDraft, type Draft } from "./draft";
 import { rememberDocument } from "./library";
 import { editorExtensions } from "./editor-extensions";
-import { fingerprint, preserveDraftVersion, replaceSourceDraft } from "./source-version";
+import { documentContentHash, fingerprint, preserveDraftVersion, replaceSourceDraft } from "./source-version";
 import { readSettings } from "./settings";
 import { defaultSettings, type Settings } from "./settings";
 import { readPersonalDictionary, writePersonalDictionary, type PersonalDictionary, type Language } from "./personal-dictionary";
@@ -118,15 +118,19 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   const currentRestoreSourcePath = useRef<string | undefined>(undefined);
   const currentSourceFingerprint = useRef<string | undefined>(undefined);
   const currentSavePath = useRef<string | undefined>(undefined);
+  const currentLocalSavePath = useRef<string | undefined>(undefined);
+  const currentLocalSaveContentHash = useRef<string | undefined>(undefined);
   const currentCloudTargets = useRef<Draft["cloudTargets"]>({});
   const currentViewMode = useRef<ViewMode>("mobile");
   const currentReady = useRef(false);
   const conflictInProgress = useRef(false);
   const saver = useRef<BackgroundSaver | null>(null);
   const cloudSync = useRef<CloudSync | null>(null);
-  const recordSaved = (draft: Draft) => {
-    setSaveStatus(`${draft.savePath ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
-    if (draft.savePath && draft.savePath === draft.sourcePath && !draft.sourcePath.startsWith("remote:")) {
+  const recordSaved = (draft: Draft, localWritten: boolean) => {
+    setSaveStatus(`${localWritten ? "DOCX и черновик сохранены" : "Черновик сохранён"} ${new Date().toLocaleTimeString("ru-RU")}`);
+    if (localWritten && draft.savePath && draft.savePath === draft.sourcePath && !draft.sourcePath.startsWith("remote:")) {
+      currentLocalSavePath.current = draft.localSavePath;
+      currentLocalSaveContentHash.current = draft.localSaveContentHash;
       setLastLocalSave({ path: draft.savePath, updatedAt: draft.updatedAt });
       if (isTauri()) void emit("docx-vim-local-saved", { id: draft.id, path: draft.savePath, updatedAt: draft.updatedAt }).catch(() => {});
     }
@@ -138,12 +142,14 @@ function DocumentEditor({ documentId }: { documentId: string }) {
   };
   if (!cloudSync.current) cloudSync.current = new CloudSync(documentId, reportCloudStates);
   if (!saver.current) saver.current = new BackgroundSaver(recordSaved,
-  800, (draft, bytes) => { if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(draft, bytes); }, () => setLocalConflict(true),
-  (revision) => { currentSourceFingerprint.current = revision; });
+  800, (draft, bytes, hash) => { if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(draft, bytes, hash); }, () => setLocalConflict(true),
+  (revision) => { currentSourceFingerprint.current = revision; },
+  (draft, hash) => !cloudHandoffBlocked.current && !!cloudSync.current?.needsSync(draft, hash));
   const currentDraft = (): Draft => ({
     version: 1, id: currentId.current, name: currentName.current,
-    document: editor!.getJSON(), updatedAt: new Date(Math.max(Date.now(), (Date.parse(latestDraftUpdatedAt.current) || 0) + 1)).toISOString(),
+    document: editor!.getJSON(), updatedAt: latestDraftUpdatedAt.current || new Date().toISOString(),
     sourcePath: currentSourcePath.current, savePath: currentSavePath.current,
+    localSavePath: currentLocalSavePath.current, localSaveContentHash: currentLocalSaveContentHash.current,
     restoreSourcePath: currentRestoreSourcePath.current,
     sourceFingerprint: currentSourceFingerprint.current,
     cloudTargets: currentCloudTargets.current,
@@ -156,7 +162,9 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     return writeDraft({ ...draft, id: handoffRecoveryId.current,
       name: `${draft.name.replace(/\.docx$/i, "")} — версия при переключении окон`,
       sourcePath: undefined, restoreSourcePath: draft.sourcePath ?? draft.restoreSourcePath,
-      sourceFingerprint: undefined, savePath: undefined, cloudTargets: {}, updatedAt: new Date().toISOString() });
+      sourceFingerprint: undefined, savePath: undefined,
+      localSavePath: undefined, localSaveContentHash: undefined,
+      cloudTargets: {}, updatedAt: new Date().toISOString() });
   };
   const scheduleHandoffBackup = (draft: Draft) => {
     if (handoffBackupTimer.current !== null) clearTimeout(handoffBackupTimer.current);
@@ -402,6 +410,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     editorProps: stableEditorProps,
     onUpdate: () => {
       if (!suppressUpdate.current) {
+        latestDraftUpdatedAt.current = new Date(Math.max(Date.now(), (Date.parse(latestDraftUpdatedAt.current) || 0) + 1)).toISOString();
         correctionRequest.current++;
         selectedIssueRef.current = null;
         correctionPendingRef.current = false;
@@ -471,16 +480,20 @@ function DocumentEditor({ documentId }: { documentId: string }) {
             : { bytes: await readFile(source), revision: undefined };
           const imported = await importDocx(bytes);
           if (cancelled) return;
+          const importedDocument = generateJSON(imported.html || "<p></p>", editorExtensions);
+          const importedHash = await documentContentHash(importedDocument);
           draft = {
             ...draft,
-            document: generateJSON(imported.html || "<p></p>", editorExtensions),
+            document: importedDocument,
             sourceFingerprint: remote ? undefined : await fingerprint(bytes),
             savePath: remote ? undefined : source,
+            localSavePath: remote ? undefined : source,
+            localSaveContentHash: remote ? undefined : importedHash,
             cloudTargets: remote ? { yandexDisk: source } : {},
             updatedAt: new Date().toISOString(),
           };
           await replaceSourceDraft(draft);
-          if (remote && revision) await rememberOpenedRemote(documentId, "yandexDisk", source, revision);
+          if (remote && revision) await rememberOpenedRemote(documentId, "yandexDisk", source, revision, importedHash);
         } catch {
           await showLibrary().catch(() => {});
           return;
@@ -499,13 +512,13 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       setVimEnabled(settings.vimEnabled);
       setHideMenu(settings.hideMenu);
       setAssistSettings(settings);
-      saver.current = new BackgroundSaver(recordSaved, settings.autosaveMs, (savedDraft, bytes) => {
-        if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(savedDraft, bytes);
+      saver.current = new BackgroundSaver(recordSaved, settings.autosaveMs, (savedDraft, bytes, hash) => {
+        if (!cloudHandoffBlocked.current) cloudSync.current?.schedule(savedDraft, bytes, hash);
       },
       () => setLocalConflict(true), (revision) => {
         currentSourceFingerprint.current = revision;
         if (isTauri()) void invoke("update_document_source_fingerprint", { id: documentId, fingerprint: revision }).catch(() => {});
-      });
+      }, (savedDraft, hash) => !cloudHandoffBlocked.current && !!cloudSync.current?.needsSync(savedDraft, hash));
       suppressUpdate.current = true;
       editor.chain().setMeta("addToHistory", false).setContent(draft.document, { emitUpdate: false }).run();
       suppressUpdate.current = false;
@@ -514,6 +527,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
       currentRestoreSourcePath.current = draft.restoreSourcePath;
       currentSourceFingerprint.current = draft.sourceFingerprint;
       currentSavePath.current = draft.savePath;
+      currentLocalSavePath.current = draft.localSavePath;
+      currentLocalSaveContentHash.current = draft.localSaveContentHash;
       currentCloudTargets.current = draft.cloudTargets ?? {};
       setDocumentName(draft.name);
       setSourceLabel(draft.sourcePath?.startsWith("remote:yandexDisk:") ? "Яндекс Диск" : draft.sourcePath ? "Локальный" : "Черновик");
@@ -548,6 +563,8 @@ function DocumentEditor({ documentId }: { documentId: string }) {
     currentRestoreSourcePath.current = draft.restoreSourcePath;
     currentSourceFingerprint.current = draft.sourceFingerprint;
     currentSavePath.current = draft.savePath;
+    currentLocalSavePath.current = draft.localSavePath;
+    currentLocalSaveContentHash.current = draft.localSaveContentHash;
     currentCloudTargets.current = draft.cloudTargets ?? {};
     setDocumentName(draft.name);
     setSourceLabel(draft.sourcePath?.startsWith("remote:yandexDisk:") ? "Яндекс Диск" : draft.sourcePath ? "Локальный" : "Черновик");
@@ -639,17 +656,22 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           if (current.editorLabel === label) {
             applySessionSnapshot(current, current.revision > sessionRevision.current || !hasEditLease.current);
             hasEditLease.current = true;
+            if (current.unconfirmedFrom) return;
             editor.setEditable(true);
             setRevision((value) => value + 1);
             requestAnimationFrame(() => editor.commands.focus());
             return;
           }
           hasEditLease.current = false;
-          const snapshot = await invoke<SessionSnapshot>("acquire_document_session", { id: documentId });
+          await invoke<SessionSnapshot>("acquire_document_session", { id: documentId });
           if (stopped) return;
+          // The released window may have published while we waited for its save.
+          // Read the authoritative snapshot once more before exposing this editor.
+          const snapshot = await invoke<SessionSnapshot>("get_document_session", { id: documentId });
           applySessionSnapshot(snapshot, true);
           hasEditLease.current = true;
           await checkSaveOwner();
+          if (snapshot.unconfirmedFrom) return;
           editor.setEditable(true);
           setRevision((value) => value + 1);
           requestAnimationFrame(() => editor.commands.focus());
@@ -719,6 +741,7 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           void isDocumentSaveOwner(documentId).then((owner) => {
             if (owner && !stopped) saver.current?.schedule(event.payload.draft);
           });
+          void onFocus();
         }),
         listen<{ id: string; editorLabel: string }>("docx-vim-yield", (event) => { void onYield(event.payload); }),
         getCurrentWindow().listen<{ id: string; token: string; replyTo: string }>("docx-vim-save-request", (event) => { void onSaveRequest(event.payload); }),
@@ -864,19 +887,23 @@ function DocumentEditor({ documentId }: { documentId: string }) {
           ? await downloadYandexDocx(source)
           : { bytes: await readFile(source), revision: undefined };
         const imported = await importDocx(bytes);
+        const importedDocument = generateJSON(imported.html || "<p></p>", editorExtensions);
+        const importedHash = await documentContentHash(importedDocument);
         const mainDraft: Draft = {
           ...authoritative,
-          document: generateJSON(imported.html || "<p></p>", editorExtensions),
+          document: importedDocument,
           sourcePath: source,
           sourceFingerprint: remote ? undefined : await fingerprint(bytes),
           savePath: remote ? undefined : source,
+          localSavePath: remote ? undefined : source,
+          localSaveContentHash: remote ? undefined : importedHash,
           cloudTargets: remote ? { yandexDisk: source } : {},
           selection: undefined,
           scrollTop: 0,
           updatedAt: new Date().toISOString(),
         };
         await writeDraft(mainDraft);
-        if (remote && revision) await cloudSync.current?.acceptOpenedRemote("yandexDisk", source, revision);
+        if (remote && revision) await cloudSync.current?.acceptOpenedRemote("yandexDisk", source, revision, importedHash);
         if (isTauri()) {
           await invoke("reset_document_session", { id: documentId, draft: mainDraft });
           for (const other of await WebviewWindow.getAll()) {

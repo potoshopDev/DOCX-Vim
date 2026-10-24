@@ -7,9 +7,9 @@ export type CloudProvider = "oneDrive" | "yandexDisk";
 export const cloudProviders: CloudProvider[] = ["oneDrive", "yandexDisk"];
 export const cloudName: Record<CloudProvider, string> = { oneDrive: "OneDrive", yandexDisk: "Яндекс Диск" };
 export type CloudStatus = "pending" | "writing" | "saved" | "retry" | "conflict";
-export type CloudState = { path: string; hash?: string; revision?: string; status: CloudStatus; conflictCopy?: string; conflictDraftId?: string; updatedAt?: string; savedDraftUpdatedAt?: string };
+export type CloudState = { path: string; hash?: string; revision?: string; status: CloudStatus; conflictCopy?: string; conflictDraftId?: string; updatedAt?: string; savedDraftUpdatedAt?: string; savedDocumentHash?: string };
 export type CloudStates = Partial<Record<CloudProvider, CloudState>>;
-type Pending = { path: string; bytes: Uint8Array; draftUpdatedAt: string };
+type Pending = { path: string; bytes: Uint8Array; draftUpdatedAt: string; documentHash: string };
 type Queue = { pending?: Pending; running: boolean; timer?: number; attempts: number };
 
 const directory = "cloud-sync";
@@ -36,9 +36,9 @@ async function writeCloudStates(id: string, states: CloudStates): Promise<void> 
   await rename(temporary, filename(id), { oldPathBaseDir: BaseDirectory.AppData, newPathBaseDir: BaseDirectory.AppData });
 }
 
-export async function rememberOpenedRemote(id: string, provider: CloudProvider, path: string, revision: string): Promise<void> {
+export async function rememberOpenedRemote(id: string, provider: CloudProvider, path: string, revision: string, documentHash: string): Promise<void> {
   const states = await readCloudStates(id);
-  states[provider] = { path, revision, status: "saved", updatedAt: new Date().toISOString() };
+  states[provider] = { path, revision, status: "saved", updatedAt: new Date().toISOString(), savedDocumentHash: documentHash };
   await writeCloudStates(id, states);
 }
 
@@ -61,15 +61,44 @@ export class CloudSync {
     await this.loading;
   }
 
-  schedule(draft: Draft, bytes: Uint8Array): void {
+  needsSync(draft: Draft, documentHash: string): boolean {
+    if (!this.loaded) return Object.values(draft.cloudTargets ?? {}).some(Boolean);
+    return cloudProviders.some((provider) => {
+      const path = draft.cloudTargets?.[provider];
+      if (!path) return false;
+      const queue = this.queues.get(provider);
+      const state = this.states[provider];
+      return !!queue?.pending || !!queue?.running || !state || state.path !== path ||
+        state.status !== "saved" || state.savedDocumentHash !== documentHash;
+    });
+  }
+
+  schedule(draft: Draft, bytes: Uint8Array, documentHash: string): void {
     if (this.retired) return;
-    if (!this.loaded) { void this.load().then(() => this.schedule(draft, bytes)); return; }
+    if (!this.loaded) { void this.load().then(() => this.schedule(draft, bytes, documentHash)); return; }
     for (const provider of cloudProviders) {
       const path = draft.cloudTargets?.[provider];
       if (!path) continue;
+      const saved = this.states[provider];
+      const existingQueue = this.queues.get(provider);
+      // An edit can be undone while its earlier upload is still waiting in the queue.
+      // Discard that stale upload when the document is back at the confirmed remote version.
+      if (saved?.path === path && saved.status === "pending" && saved.savedDocumentHash === documentHash &&
+        existingQueue?.pending && !existingQueue.running && existingQueue.attempts === 0) {
+        if (existingQueue.timer) clearTimeout(existingQueue.timer);
+        existingQueue.timer = undefined;
+        existingQueue.pending = undefined;
+        existingQueue.attempts = 0;
+        this.states[provider] = { ...saved, status: "saved", savedDraftUpdatedAt: draft.updatedAt };
+        this.onChange({ ...this.states });
+        void this.persist();
+        continue;
+      }
+      if (saved?.path === path && saved.status === "saved" && saved.savedDocumentHash === documentHash &&
+        !existingQueue?.pending && !existingQueue?.running) continue;
       let queue = this.queues.get(provider);
       if (!queue) { queue = { running: false, attempts: 0 }; this.queues.set(provider, queue); }
-      queue.pending = { path, bytes, draftUpdatedAt: draft.updatedAt };
+      queue.pending = { path, bytes, draftUpdatedAt: draft.updatedAt, documentHash };
       const state = this.states[provider];
       if (!state || state.path !== path) this.states[provider] = { path, status: "pending" };
       else if (state.status !== "conflict") this.states[provider] = { ...state, status: "pending" };
@@ -97,12 +126,12 @@ export class CloudSync {
     void this.persist();
   }
 
-  async acceptOpenedRemote(provider: CloudProvider, path: string, revision: string): Promise<void> {
+  async acceptOpenedRemote(provider: CloudProvider, path: string, revision: string, documentHash: string): Promise<void> {
     await this.load();
     const queue = this.queues.get(provider);
     if (queue?.timer) clearTimeout(queue.timer);
     if (queue) { queue.pending = undefined; queue.attempts = 0; }
-    this.states[provider] = { path, revision, status: "saved", updatedAt: new Date().toISOString() };
+    this.states[provider] = { path, revision, status: "saved", updatedAt: new Date().toISOString(), savedDocumentHash: documentHash };
     this.onChange({ ...this.states });
     await this.persist();
   }
@@ -136,11 +165,11 @@ export class CloudSync {
           if (isRemoteTarget(pending.path)) {
             if (state.hash === newHash && state.revision) {
               await verifyRemoteRevision(provider, pending.path, state.revision);
-              await this.update(provider, { ...state, status: "saved", savedDraftUpdatedAt: pending.draftUpdatedAt });
+              await this.update(provider, { ...state, status: "saved", savedDraftUpdatedAt: pending.draftUpdatedAt, savedDocumentHash: pending.documentHash });
               continue;
             }
             const revision = await uploadRemote(provider, pending.path, pending.bytes, state.revision);
-            await this.update(provider, { path: pending.path, hash: newHash, revision, status: "saved", updatedAt: new Date().toISOString(), savedDraftUpdatedAt: pending.draftUpdatedAt });
+            await this.update(provider, { path: pending.path, hash: newHash, revision, status: "saved", updatedAt: new Date().toISOString(), savedDraftUpdatedAt: pending.draftUpdatedAt, savedDocumentHash: pending.documentHash });
             queue.attempts = 0;
             continue;
           }
@@ -152,7 +181,7 @@ export class CloudSync {
             }
           }
           if (state.hash !== newHash) await writeFile(pending.path, pending.bytes);
-          await this.update(provider, { path: pending.path, hash: newHash, status: "saved", updatedAt: new Date().toISOString(), savedDraftUpdatedAt: pending.draftUpdatedAt });
+          await this.update(provider, { path: pending.path, hash: newHash, status: "saved", updatedAt: new Date().toISOString(), savedDraftUpdatedAt: pending.draftUpdatedAt, savedDocumentHash: pending.documentHash });
           queue.attempts = 0;
         } catch (error) {
           if (error instanceof RemoteConflict) {
