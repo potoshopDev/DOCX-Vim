@@ -267,6 +267,9 @@ export class VimAdapter {
       this.issuePending = 0;
       return false;
     }
+    // After f/F/t/T the next key names a document character, not a Vim command.
+    // Keep the keyboard layout here so fж and dfж search for Cyrillic ж.
+    if (state.findPending) return false;
     if (state.mode !== "normal") this.issuePending = 0;
     if (event.ctrlKey && !event.altKey && (event.code === "KeyW" || /[wц]/i.test(event.key))) {
       this.issuePending = 0;
