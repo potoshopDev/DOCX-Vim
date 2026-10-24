@@ -1,4 +1,11 @@
 # Add project specific ProGuard rules here.
+# Rust calls these methods through JNI by their exact Java names and signatures.
+# R8 cannot see those call sites, so release builds must retain the methods.
+-keepclassmembers class ru.docxvim.app.MainActivity {
+    public void registerDocxTask(java.lang.String, java.lang.String);
+    public void focusDocxTask(java.lang.String, java.lang.String);
+    public void closeDocxTask(java.lang.String, java.lang.String);
+}
 # You can control the set of applied configuration files using the
 # proguardFiles setting in build.gradle.
 #
